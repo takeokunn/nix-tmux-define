@@ -1,0 +1,19 @@
+[package]
+name = "nix-tmux-define"
+version = "0.1.0"
+edition = "2021"
+description = "Declarative tmux session manager driven by JSON / Home Manager"
+license = "MIT"
+
+[[bin]]
+name = "nix-tmux-define"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

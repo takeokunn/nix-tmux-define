@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use nix_tmux_define::{Compiler, Session};
-use std::path::PathBuf;
+use nix_tmux_define::{Compiler, Executor, RealTmux, Session, load_session, load_sessions_from_dir};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
     name = "nix-tmux-define",
-    about = "Declarative tmux session manager — JSON config → bash script",
+    about = "Declarative tmux session manager — JSON / TOML / YAML config → tmux session",
     version
 )]
 struct Cli {
@@ -16,26 +16,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a session script and execute it immediately
+    /// Start a tmux session from a config file (uses RealTmux, no bash script)
     Run {
-        /// Path to the JSON session config
+        /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
     },
 
     /// Print the generated bash script to stdout without executing
     Print {
-        /// Path to the JSON session config
+        /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
     },
 
     /// Parse and validate a config file, reporting any errors
     Validate {
-        /// Path to the JSON session config
+        /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
     },
+
+    /// Kill and re-create a session from a config file
+    Reload {
+        /// Path to the session config (JSON, TOML, or YAML)
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+
+    /// List all sessions from config files
+    List {
+        #[arg(long, value_name = "PATH")]
+        config: Vec<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        config_dir: Option<PathBuf>,
+    },
+
+    /// Print the JSON Schema for the session config format
+    Schema,
 
     /// Emit shell completion scripts for the given shell
     Completions {
@@ -44,41 +62,75 @@ enum Command {
     },
 }
 
-fn load(path: &PathBuf) -> Result<Session> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read '{}'", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("invalid JSON in '{}'", path.display()))
-}
-
 fn generate(session: &Session) -> String {
     let mut compiler = Compiler::new();
     compiler.compile(session);
     compiler.into_script()
 }
 
+fn session_running(name: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["has-session", "-t", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn print_session_list(sessions: &[Session]) {
+    for s in sessions {
+        let running = if session_running(&s.name) { " [running]" } else { "" };
+        println!(
+            "{}{} — {} window(s)",
+            s.name,
+            running,
+            s.windows.len()
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run { config } => {
-            let script = generate(&load(&config)?);
-            let status = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&script)
-                .status()
-                .context("failed to spawn bash")?;
-            if !status.success() {
-                anyhow::bail!("session script exited with: {}", status);
-            }
+            let session = load_session(&config)?;
+            let backend = RealTmux;
+            let executor = Executor::new(&backend);
+            executor.run(&session)?;
         }
 
         Command::Print { config } => {
-            print!("{}", generate(&load(&config)?));
+            let session = load_session(&config)?;
+            print!("{}", generate(&session));
         }
 
         Command::Validate { config } => {
-            let session = load(&config)?;
+            let session = load_session(&config)?;
             eprintln!("✓  '{}' — {} window(s)", session.name, session.windows.len());
+        }
+
+        Command::Reload { config } => {
+            let session = load_session(&config)?;
+            let backend = RealTmux;
+            let executor = Executor::new(&backend);
+            executor.reload(&session)?;
+        }
+
+        Command::List { config: configs, config_dir } => {
+            let mut sessions = Vec::new();
+            for p in &configs {
+                sessions.push(load_session(p)?);
+            }
+            if let Some(dir) = &config_dir {
+                sessions.extend(load_sessions_from_dir(dir)?);
+            }
+            if configs.is_empty() && config_dir.is_none() {
+                sessions.extend(load_sessions_from_dir(Path::new("."))?);
+            }
+            print_session_list(&sessions);
+        }
+
+        Command::Schema => {
+            println!("{}", nix_tmux_define::json_schema());
         }
 
         Command::Completions { shell } => {

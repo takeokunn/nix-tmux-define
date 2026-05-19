@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Declarative tmux session manager driven by JSON / Home Manager"
 license = "MIT"
+authors = ["takeokunn"]
+repository = "https://github.com/takeokunn/nix-tmux-define"
+homepage = "https://github.com/takeokunn/nix-tmux-define"
+documentation = "https://docs.rs/nix-tmux-define"
+keywords = ["tmux", "nix", "session-manager", "terminal", "dotfiles"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [lib]
 name = "nix_tmux_define"
@@ -19,6 +26,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 anyhow = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+schemars = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

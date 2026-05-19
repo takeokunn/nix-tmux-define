@@ -18,6 +18,8 @@ pub trait TmuxBackend {
     fn attach_or_switch(&self, session: &str) -> Result<()>;
     fn kill_session(&self, name: &str) -> Result<()>;
     fn capture_pane(&self, pane_id: &str) -> Result<String>;
+    /// Run an arbitrary shell command (used for pre_hook execution).
+    fn run_command(&self, cmd: &str) -> Result<()>;
 }
 
 // ─── RealTmux ─────────────────────────────────────────────────────────────────
@@ -160,6 +162,11 @@ impl TmuxBackend for RealTmux {
             .output()?;
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
+
+    fn run_command(&self, cmd: &str) -> Result<()> {
+        std::process::Command::new("bash").args(["-c", cmd]).status()?;
+        Ok(())
+    }
 }
 
 // ─── RecordingBackend ─────────────────────────────────────────────────────────
@@ -267,6 +274,11 @@ impl TmuxBackend for RecordingBackend {
         self.record(format!("capture-pane:{}", pane_id));
         Ok(self.capture_output.borrow().clone())
     }
+
+    fn run_command(&self, cmd: &str) -> Result<()> {
+        self.record(format!("run-command:{}", cmd));
+        Ok(())
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -279,6 +291,7 @@ mod tests {
     fn recording_backend_has_session_default_false() {
         let b = RecordingBackend::new();
         assert!(!b.has_session("mysession"));
+        assert!(b.calls().iter().any(|c| c == "has-session:mysession"));
     }
 
     #[test]
@@ -286,5 +299,110 @@ mod tests {
         let b = RecordingBackend::new();
         b.session_exists.set(true);
         assert!(b.has_session("mysession"));
+    }
+
+    #[test]
+    fn recording_backend_new_session() {
+        let b = RecordingBackend::new();
+        let id = b.new_session("s", "/tmp", "main").unwrap();
+        assert_eq!(id, "%0");
+        assert!(b.calls().iter().any(|c| c.starts_with("new-session:s:/tmp:main:")));
+    }
+
+    #[test]
+    fn recording_backend_split_window() {
+        let b = RecordingBackend::new();
+        let id = b.split_window("%0", "-h", 40, "/tmp").unwrap();
+        assert_eq!(id, "%0");
+        assert!(b.calls().iter().any(|c| c.starts_with("split-window:%0:-h:40:/tmp:")));
+    }
+
+    #[test]
+    fn recording_backend_new_window() {
+        let b = RecordingBackend::new();
+        let id = b.new_window("s", "logs", "/tmp").unwrap();
+        assert_eq!(id, "%0");
+        assert!(b.calls().iter().any(|c| c.starts_with("new-window:s:logs:/tmp:")));
+    }
+
+    #[test]
+    fn recording_backend_send_keys() {
+        let b = RecordingBackend::new();
+        b.send_keys("%0", "vim .").unwrap();
+        assert!(b.calls().iter().any(|c| c == "send-keys:%0:vim ."));
+    }
+
+    #[test]
+    fn recording_backend_select_pane() {
+        let b = RecordingBackend::new();
+        b.select_pane("%0").unwrap();
+        assert!(b.calls().iter().any(|c| c == "select-pane:%0"));
+    }
+
+    #[test]
+    fn recording_backend_set_pane_title() {
+        let b = RecordingBackend::new();
+        b.set_pane_title("%0", "editor").unwrap();
+        assert!(b.calls().iter().any(|c| c == "set-pane-title:%0:editor"));
+    }
+
+    #[test]
+    fn recording_backend_set_option() {
+        let b = RecordingBackend::new();
+        b.set_option("s", "status", "off").unwrap();
+        assert!(b.calls().iter().any(|c| c == "set-option:s:status:off"));
+    }
+
+    #[test]
+    fn recording_backend_set_window_option() {
+        let b = RecordingBackend::new();
+        b.set_window_option("s", "w", "sync", "on").unwrap();
+        assert!(b.calls().iter().any(|c| c == "set-window-option:s:w:sync:on"));
+    }
+
+    #[test]
+    fn recording_backend_select_layout() {
+        let b = RecordingBackend::new();
+        b.select_layout("s", "w", "tiled").unwrap();
+        assert!(b.calls().iter().any(|c| c == "select-layout:s:w:tiled"));
+    }
+
+    #[test]
+    fn recording_backend_select_window() {
+        let b = RecordingBackend::new();
+        b.select_window("s", 2).unwrap();
+        assert!(b.calls().iter().any(|c| c == "select-window:s:2"));
+    }
+
+    #[test]
+    fn recording_backend_attach_or_switch() {
+        let b = RecordingBackend::new();
+        b.attach_or_switch("s").unwrap();
+        assert!(b.calls().iter().any(|c| c == "attach-or-switch:s"));
+    }
+
+    #[test]
+    fn recording_backend_kill_session_clears_flag() {
+        let b = RecordingBackend::new();
+        b.session_exists.set(true);
+        b.kill_session("s").unwrap();
+        assert!(!b.session_exists.get());
+        assert!(b.calls().iter().any(|c| c == "kill-session:s"));
+    }
+
+    #[test]
+    fn recording_backend_capture_pane() {
+        let b = RecordingBackend::new();
+        *b.capture_output.borrow_mut() = "hello world".into();
+        let out = b.capture_pane("%0").unwrap();
+        assert_eq!(out, "hello world");
+        assert!(b.calls().iter().any(|c| c == "capture-pane:%0"));
+    }
+
+    #[test]
+    fn recording_backend_run_command() {
+        let b = RecordingBackend::new();
+        b.run_command("echo hi").unwrap();
+        assert!(b.calls().iter().any(|c| c == "run-command:echo hi"));
     }
 }

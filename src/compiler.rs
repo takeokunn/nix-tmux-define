@@ -939,6 +939,50 @@ mod tests {
     }
 
     #[test]
+    fn compiler_wait_for_in_nested_split() {
+        // wait_for lives in the SECOND child of a split, exercising the recursive
+        // layout_uses_wait_for(second) path in session_uses_wait_for.
+        use crate::model::WaitFor;
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Split {
+                    direction: Direction::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Pane {
+                        command: None,
+                        focus: false,
+                        title: None,
+                        wait_for: None,
+                    }),
+                    second: Box::new(LayoutNode::Pane {
+                        command: Some("npm start".into()),
+                        focus: false,
+                        title: None,
+                        wait_for: Some(WaitFor { pattern: "listening".into(), timeout: 5 }),
+                    }),
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let s = compile(&session);
+        assert!(
+            s.contains("_ntd_wait_pane"),
+            "_ntd_wait_pane must be emitted when wait_for is nested in second child"
+        );
+        assert!(s.contains("'listening'"));
+    }
+
+    #[test]
     fn compiler_template_var() {
         let mut vars = HashMap::new();
         vars.insert("mydir".to_string(), "/home/user/project".to_string());

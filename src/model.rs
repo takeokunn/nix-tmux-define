@@ -121,6 +121,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_quote_plain() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_quote_with_spaces() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn shell_quote_with_apostrophe() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn resolve_vars_no_placeholders() {
+        let vars = HashMap::new();
+        let result = resolve_vars("just a plain string", &vars);
+        assert_eq!(result, "just a plain string");
+    }
+
+    #[test]
     fn wait_for_default_timeout() {
         let wf: WaitFor = serde_json::from_str(r#"{"pattern": "ready"}"#).unwrap();
         assert_eq!(wf.timeout, 30);

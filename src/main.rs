@@ -76,15 +76,65 @@ fn session_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn format_session_line(s: &Session, is_running: bool) -> String {
+    let running = if is_running { " [running]" } else { "" };
+    format!("{}{} — {} window(s)", s.name, running, s.windows.len())
+}
+
 fn print_session_list(sessions: &[Session]) {
     for s in sessions {
-        let running = if session_running(&s.name) { " [running]" } else { "" };
-        println!(
-            "{}{} — {} window(s)",
-            s.name,
-            running,
-            s.windows.len()
-        );
+        println!("{}", format_session_line(s, session_running(&s.name)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix_tmux_define::{LayoutNode, Session, Window};
+    use std::collections::HashMap;
+
+    fn make_session(name: &str, window_count: usize) -> Session {
+        let windows: Vec<Window> = (0..window_count)
+            .map(|i| Window {
+                name: format!("w{}", i),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane { command: None, focus: false, title: None, wait_for: None },
+            })
+            .collect();
+        Session {
+            name: name.into(),
+            root: None,
+            windows,
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn format_session_line_not_running() {
+        let s = make_session("dev", 2);
+        let line = format_session_line(&s, false);
+        assert_eq!(line, "dev — 2 window(s)");
+    }
+
+    #[test]
+    fn format_session_line_running() {
+        let s = make_session("prod", 3);
+        let line = format_session_line(&s, true);
+        assert_eq!(line, "prod [running] — 3 window(s)");
+    }
+
+    #[test]
+    fn generate_returns_bash_script() {
+        let s = make_session("test", 1);
+        let script = generate(&s);
+        assert!(script.starts_with("#!/usr/bin/env bash"));
+        assert!(script.contains("tmux new-session"));
     }
 }
 

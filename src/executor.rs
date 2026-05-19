@@ -44,9 +44,7 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
     fn create_session(&self, session: &Session) -> Result<()> {
         let vars = &session.vars;
         if let Some(hook) = &session.pre_hook {
-            std::process::Command::new("bash")
-                .args(["-c", &resolve_vars(hook, vars)])
-                .status()?;
+            self.backend.run_command(&resolve_vars(hook, vars))?;
         }
         for (idx, window) in session.windows.iter().enumerate() {
             self.create_window(session, window, idx, vars)?;
@@ -604,6 +602,242 @@ mod tests {
             calls.iter().any(|c| c == "send-keys:%0:cd $PWD"),
             "{{cwd}} should resolve to $PWD"
         );
+    }
+
+    #[test]
+    fn executor_multiple_windows_uses_new_window() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![
+                Window {
+                    name: "first".into(),
+                    root: None,
+                    env: vec![],
+                    options: HashMap::new(),
+                    select_layout: None,
+                    layout: LayoutNode::Pane {
+                        command: None,
+                        focus: false,
+                        title: None,
+                        wait_for: None,
+                    },
+                },
+                Window {
+                    name: "second".into(),
+                    root: None,
+                    env: vec![],
+                    options: HashMap::new(),
+                    select_layout: None,
+                    layout: LayoutNode::Pane {
+                        command: Some("bash".into()),
+                        focus: false,
+                        title: None,
+                        wait_for: None,
+                    },
+                },
+            ],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        assert!(calls.iter().any(|c| c.starts_with("new-session:")));
+        assert!(calls.iter().any(|c| c.starts_with("new-window:")));
+    }
+
+    #[test]
+    fn executor_vertical_split() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Split {
+                    direction: Direction::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Pane {
+                        command: Some("top".into()),
+                        focus: false,
+                        title: None,
+                        wait_for: None,
+                    }),
+                    second: Box::new(LayoutNode::Pane {
+                        command: Some("htop".into()),
+                        focus: false,
+                        title: None,
+                        wait_for: None,
+                    }),
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("-v")),
+            "vertical split should use -v flag"
+        );
+    }
+
+    #[test]
+    fn executor_pre_hook_runs_before_session() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            }],
+            env: vec![],
+            pre_hook: Some("nix build".into()),
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        let hook_pos = calls.iter().position(|c| c == "run-command:nix build").unwrap();
+        let sess_pos = calls.iter().position(|c| c.starts_with("new-session:")).unwrap();
+        assert!(hook_pos < sess_pos, "pre_hook must run before new-session");
+    }
+
+    #[test]
+    fn executor_window_root_overrides_session_root() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/session-root".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: Some("/window-root".into()),
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("/window-root")),
+            "window root should be used"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("/session-root")),
+            "session root should not be used when window root is set"
+        );
+    }
+
+    #[test]
+    fn executor_no_root_defaults_to_home() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: None,
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("$HOME")),
+            "null root should fall back to $HOME"
+        );
+    }
+
+    #[test]
+    fn executor_wait_for_checks_multiple_iterations() {
+        // timeout=2, pattern never found → should error after 2 iterations
+        // This exercises the elapsed+1 < timeout sleep branch (but RecordingBackend
+        // never sleeps, so the loop terminates immediately).
+        let b = RecordingBackend::new();
+        *b.capture_output.borrow_mut() = "not what we want".into();
+
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: Some(WaitFor {
+                        pattern: "ready".into(),
+                        timeout: 2,
+                    }),
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        let result = ex.run(&session);
+        assert!(result.is_err());
+        // Two capture-pane calls should have been recorded (one per iteration)
+        let capture_count = b.calls().iter().filter(|c| c.starts_with("capture-pane:")).count();
+        assert_eq!(capture_count, 2, "should attempt exactly timeout iterations");
     }
 
     // Suppress unused import warning for EnvVar in this test module

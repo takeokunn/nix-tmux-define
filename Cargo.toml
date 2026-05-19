@@ -5,6 +5,10 @@ edition = "2021"
 description = "Declarative tmux session manager driven by JSON / Home Manager"
 license = "MIT"
 
+[lib]
+name = "nix_tmux_define"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nix-tmux-define"
 path = "src/main.rs"
@@ -13,6 +17,7 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 anyhow = "1"
 
 [dev-dependencies]

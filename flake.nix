@@ -18,17 +18,12 @@
 
       perSystem =
         { pkgs, system, ... }:
-        {
-          # ── Package ──────────────────────────────────────────────────────────
-          packages.default = pkgs.rustPlatform.buildRustPackage {
+        let
+          pkg = pkgs.rustPlatform.buildRustPackage {
             pname = "nix-tmux-define";
             version = "0.1.0";
             src = ./.;
-
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-
+            cargoLock.lockFile = ./Cargo.lock;
             meta = {
               description = "Declarative tmux session manager driven by JSON / Home Manager";
               homepage = "https://github.com/takeokunn/nix-tmux-define";
@@ -36,8 +31,17 @@
               mainProgram = "nix-tmux-define";
             };
           };
+        in
+        {
+          # ── Packages ────────────────────────────────────────────────────────
+          packages.default = pkg;
+          packages.nix-tmux-define = pkg;
 
-          packages.nix-tmux-define = self.packages.${system}.default;
+          # ── App (nix run) ────────────────────────────────────────────────────
+          apps.default = {
+            type = "app";
+            program = "${pkg}/bin/nix-tmux-define";
+          };
 
           # ── Dev Shell ─────────────────────────────────────────────────────────
           devShells.default = pkgs.mkShell {
@@ -57,16 +61,15 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            # Run `cargo test` during the check build
-            buildPhase = "cargo test --release 2>&1";
+            doCheck = true;
             installPhase = "mkdir -p $out";
           };
 
           # ── Formatter ─────────────────────────────────────────────────────────
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
         };
 
-      # ── Home Manager Module (system-independent) ──────────────────────────
+      # ── Home Manager Module ───────────────────────────────────────────────────
       flake.homeManagerModules = {
         nix-tmux-define = import ./module.nix { inherit self; };
         default = import ./module.nix { inherit self; };

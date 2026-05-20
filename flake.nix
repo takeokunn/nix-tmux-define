@@ -52,7 +52,30 @@
               clippy
               rustfmt
               tmux
+              nixd
             ];
+            shellHook = ''
+              cat <<'USAGE_EOF'
+
+=== nix-tmux-define Development Shell ===
+
+Build & run:
+  cargo build            # Debug build
+  cargo build --release  # Release build
+  cargo run -- <file>    # Run with a JSON session file
+
+Test & lint:
+  cargo test             # Run all unit tests
+  cargo clippy           # Run linter
+  cargo fmt              # Format source code
+
+Nix:
+  nix build              # Build the package via Nix
+  nix run -- <file>      # Run via Nix (uses release build)
+  nix flake check        # Run checks in sandbox
+
+USAGE_EOF
+            '';
           };
 
           # ── Checks ────────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use nix_tmux_define::{Compiler, Executor, RealTmux, Session, load_session, load_sessions_from_dir};
+use nix_tmux_define::{
+    load_session, load_sessions_from_dir, Compiler, Executor, RealTmux, Session,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -101,7 +103,12 @@ mod tests {
                 env: vec![],
                 options: HashMap::new(),
                 select_layout: None,
-                layout: LayoutNode::Pane { command: None, focus: false, title: None, wait_for: None },
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
             })
             .collect();
         Session {
@@ -155,7 +162,11 @@ fn main() -> Result<()> {
 
         Command::Validate { config } => {
             let session = load_session(&config)?;
-            eprintln!("✓  '{}' — {} window(s)", session.name, session.windows.len());
+            eprintln!(
+                "✓  '{}' — {} window(s)",
+                session.name,
+                session.windows.len()
+            );
         }
 
         Command::Reload { config } => {
@@ -165,7 +176,10 @@ fn main() -> Result<()> {
             executor.reload(&session)?;
         }
 
-        Command::List { config: configs, config_dir } => {
+        Command::List {
+            config: configs,
+            config_dir,
+        } => {
             let mut sessions = Vec::new();
             for p in &configs {
                 sessions.push(load_session(p)?);

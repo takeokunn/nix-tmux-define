@@ -11,8 +11,9 @@ pub fn load_session(path: &Path) -> Result<Session> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read '{}'", path.display()))?;
     match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => toml::from_str(&raw)
-            .with_context(|| format!("invalid TOML in '{}'", path.display())),
+        Some("toml") => {
+            toml::from_str(&raw).with_context(|| format!("invalid TOML in '{}'", path.display()))
+        }
         Some("yaml") | Some("yml") => serde_yaml::from_str(&raw)
             .with_context(|| format!("invalid YAML in '{}'", path.display())),
         _ => serde_json::from_str(&raw)
@@ -185,7 +186,11 @@ type = "pane"
         std::fs::write(dir.path().join("session.json"), json_content()).unwrap();
 
         let sessions = load_sessions_from_dir(dir.path()).unwrap();
-        assert_eq!(sessions.len(), 1, "only .json/.toml/.yaml/.yml should be loaded");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "only .json/.toml/.yaml/.yml should be loaded"
+        );
     }
 
     #[test]

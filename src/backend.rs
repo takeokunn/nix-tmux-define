@@ -78,7 +78,16 @@ impl TmuxBackend for RealTmux {
     fn new_window(&self, session: &str, name: &str, root: &str) -> Result<String> {
         let out = std::process::Command::new("tmux")
             .args([
-                "new-window", "-t", session, "-n", name, "-c", root, "-P", "-F", "#{pane_id}",
+                "new-window",
+                "-t",
+                session,
+                "-n",
+                name,
+                "-c",
+                root,
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .output()?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -164,7 +173,9 @@ impl TmuxBackend for RealTmux {
     }
 
     fn run_command(&self, cmd: &str) -> Result<()> {
-        std::process::Command::new("bash").args(["-c", cmd]).status()?;
+        std::process::Command::new("bash")
+            .args(["-c", cmd])
+            .status()?;
         Ok(())
     }
 }
@@ -208,13 +219,19 @@ impl TmuxBackend for RecordingBackend {
 
     fn new_session(&self, name: &str, root: &str, window_name: &str) -> Result<String> {
         let id = self.next_pane();
-        self.record(format!("new-session:{}:{}:{}:{}", name, root, window_name, id));
+        self.record(format!(
+            "new-session:{}:{}:{}:{}",
+            name, root, window_name, id
+        ));
         Ok(id)
     }
 
     fn split_window(&self, pane_id: &str, flag: &str, pct: u32, root: &str) -> Result<String> {
         let id = self.next_pane();
-        self.record(format!("split-window:{}:{}:{}:{}:{}", pane_id, flag, pct, root, id));
+        self.record(format!(
+            "split-window:{}:{}:{}:{}:{}",
+            pane_id, flag, pct, root, id
+        ));
         Ok(id)
     }
 
@@ -245,7 +262,10 @@ impl TmuxBackend for RecordingBackend {
     }
 
     fn set_window_option(&self, session: &str, window: &str, key: &str, value: &str) -> Result<()> {
-        self.record(format!("set-window-option:{}:{}:{}:{}", session, window, key, value));
+        self.record(format!(
+            "set-window-option:{}:{}:{}:{}",
+            session, window, key, value
+        ));
         Ok(())
     }
 
@@ -306,7 +326,10 @@ mod tests {
         let b = RecordingBackend::new();
         let id = b.new_session("s", "/tmp", "main").unwrap();
         assert_eq!(id, "%0");
-        assert!(b.calls().iter().any(|c| c.starts_with("new-session:s:/tmp:main:")));
+        assert!(b
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("new-session:s:/tmp:main:")));
     }
 
     #[test]
@@ -314,7 +337,10 @@ mod tests {
         let b = RecordingBackend::new();
         let id = b.split_window("%0", "-h", 40, "/tmp").unwrap();
         assert_eq!(id, "%0");
-        assert!(b.calls().iter().any(|c| c.starts_with("split-window:%0:-h:40:/tmp:")));
+        assert!(b
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("split-window:%0:-h:40:/tmp:")));
     }
 
     #[test]
@@ -322,7 +348,10 @@ mod tests {
         let b = RecordingBackend::new();
         let id = b.new_window("s", "logs", "/tmp").unwrap();
         assert_eq!(id, "%0");
-        assert!(b.calls().iter().any(|c| c.starts_with("new-window:s:logs:/tmp:")));
+        assert!(b
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("new-window:s:logs:/tmp:")));
     }
 
     #[test]
@@ -357,7 +386,10 @@ mod tests {
     fn recording_backend_set_window_option() {
         let b = RecordingBackend::new();
         b.set_window_option("s", "w", "sync", "on").unwrap();
-        assert!(b.calls().iter().any(|c| c == "set-window-option:s:w:sync:on"));
+        assert!(b
+            .calls()
+            .iter()
+            .any(|c| c == "set-window-option:s:w:sync:on"));
     }
 
     #[test]

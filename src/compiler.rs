@@ -1,5 +1,5 @@
-use crate::model::{Direction, LayoutNode, Session, Window};
 use crate::model::{resolve_vars, shell_quote};
+use crate::model::{Direction, LayoutNode, Session, Window};
 
 // ─── Internal record ─────────────────────────────────────────────────────────
 
@@ -63,7 +63,10 @@ impl Compiler {
     }
 
     fn session_uses_wait_for(&self, session: &Session) -> bool {
-        session.windows.iter().any(|w| self.layout_uses_wait_for(&w.layout))
+        session
+            .windows
+            .iter()
+            .any(|w| self.layout_uses_wait_for(&w.layout))
     }
 
     fn layout_uses_wait_for(&self, node: &LayoutNode) -> bool {
@@ -138,7 +141,11 @@ impl Compiler {
 
     fn compile_window(&mut self, window: &Window, index: usize, session: &Session) {
         let root = resolve_vars(
-            window.root.as_deref().or(session.root.as_deref()).unwrap_or("$HOME"),
+            window
+                .root
+                .as_deref()
+                .or(session.root.as_deref())
+                .unwrap_or("$HOME"),
             &session.vars,
         );
 
@@ -249,7 +256,12 @@ impl Compiler {
         records: &mut Vec<PaneRecord>,
     ) {
         match node {
-            LayoutNode::Pane { command, focus, title, wait_for } => {
+            LayoutNode::Pane {
+                command,
+                focus,
+                title,
+                wait_for,
+            } => {
                 records.push(PaneRecord {
                     var: current.to_string(),
                     command: command.as_ref().map(|c| resolve_vars(c, vars)),
@@ -260,7 +272,12 @@ impl Compiler {
                     wait_timeout: wait_for.as_ref().map(|wf| wf.timeout),
                 });
             }
-            LayoutNode::Split { direction, ratio, first, second } => {
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
                 let new_pane = self.alloc_pane();
                 let flag = match direction {
                     Direction::Horizontal => "-h",
@@ -355,7 +372,12 @@ mod tests {
         let node: LayoutNode = serde_json::from_value(json!({"type": "pane"})).unwrap();
         assert_eq!(
             node,
-            LayoutNode::Pane { command: None, focus: false, title: None, wait_for: None }
+            LayoutNode::Pane {
+                command: None,
+                focus: false,
+                title: None,
+                wait_for: None
+            }
         );
     }
 
@@ -390,7 +412,9 @@ mod tests {
         }))
         .unwrap();
         match node {
-            LayoutNode::Split { direction, ratio, .. } => {
+            LayoutNode::Split {
+                direction, ratio, ..
+            } => {
                 assert_eq!(direction, Direction::Horizontal);
                 assert!((ratio - 0.6).abs() < f64::EPSILON);
             }
@@ -429,7 +453,10 @@ mod tests {
             windows: vec![Window {
                 name: "w".into(),
                 root: None,
-                env: vec![EnvVar { key: "FOO".into(), value: "bar".into() }],
+                env: vec![EnvVar {
+                    key: "FOO".into(),
+                    value: "bar".into(),
+                }],
                 options: HashMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Split {
@@ -480,7 +507,10 @@ mod tests {
         let s = compile(&single_pane("s", "bash"));
         // Both the guard and the final attach must use the TMUX variable
         let count = s.matches("${TMUX:-}").count();
-        assert_eq!(count, 2, "TMUX detection should appear in guard and final attach");
+        assert_eq!(
+            count, 2,
+            "TMUX detection should appear in guard and final attach"
+        );
     }
 
     #[test]
@@ -600,7 +630,10 @@ mod tests {
         assert!(s.contains("'emacs'"));
         assert!(s.contains("'cargo watch'"));
         assert!(s.contains("'git log'"));
-        assert!(s.contains("select-pane -t \"${PANE_0}\""), "emacs pane focused");
+        assert!(
+            s.contains("select-pane -t \"${PANE_0}\""),
+            "emacs pane focused"
+        );
     }
 
     #[test]
@@ -686,8 +719,14 @@ mod tests {
                 },
             }],
             env: vec![
-                EnvVar { key: "EDITOR".into(), value: "nvim".into() },
-                EnvVar { key: "PAGER".into(), value: "less".into() },
+                EnvVar {
+                    key: "EDITOR".into(),
+                    value: "nvim".into(),
+                },
+                EnvVar {
+                    key: "PAGER".into(),
+                    value: "less".into(),
+                },
             ],
             pre_hook: None,
             options: HashMap::new(),
@@ -706,7 +745,10 @@ mod tests {
             windows: vec![Window {
                 name: "w".into(),
                 root: None,
-                env: vec![EnvVar { key: "NODE_ENV".into(), value: "development".into() }],
+                env: vec![EnvVar {
+                    key: "NODE_ENV".into(),
+                    value: "development".into(),
+                }],
                 options: HashMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
@@ -806,7 +848,10 @@ mod tests {
         };
         let s = compile(&session);
         assert!(s.contains("'/window-root'"), "window root takes precedence");
-        assert!(!s.contains("'/session-root'"), "session root not used when window root is set");
+        assert!(
+            !s.contains("'/session-root'"),
+            "session root not used when window root is set"
+        );
     }
 
     // ── New feature tests ─────────────────────────────────────────────────────
@@ -837,7 +882,10 @@ mod tests {
             vars: HashMap::new(),
         };
         let s = compile(&session);
-        assert!(s.contains("tmux set-option"), "set-option should appear in script");
+        assert!(
+            s.contains("tmux set-option"),
+            "set-option should appear in script"
+        );
         assert!(s.contains("'status'"), "option key should be quoted");
         assert!(s.contains("'off'"), "option value should be quoted");
     }
@@ -868,7 +916,10 @@ mod tests {
             vars: HashMap::new(),
         };
         let s = compile(&session);
-        assert!(s.contains("tmux set-window-option"), "set-window-option should appear");
+        assert!(
+            s.contains("tmux set-window-option"),
+            "set-window-option should appear"
+        );
         assert!(s.contains("'synchronize-panes'"), "option key quoted");
         assert!(s.contains("'on'"), "option value quoted");
     }
@@ -897,7 +948,10 @@ mod tests {
             vars: HashMap::new(),
         };
         let s = compile(&session);
-        assert!(s.contains("tmux select-layout"), "select-layout should appear");
+        assert!(
+            s.contains("tmux select-layout"),
+            "select-layout should appear"
+        );
         assert!(s.contains("'tiled'"), "layout preset quoted");
     }
 
@@ -917,7 +971,10 @@ mod tests {
                     command: Some("npm start".into()),
                     focus: false,
                     title: None,
-                    wait_for: Some(WaitFor { pattern: "ready".into(), timeout: 30 }),
+                    wait_for: Some(WaitFor {
+                        pattern: "ready".into(),
+                        timeout: 30,
+                    }),
                 },
             }],
             env: vec![],
@@ -926,7 +983,10 @@ mod tests {
             vars: HashMap::new(),
         };
         let s = compile(&session);
-        assert!(s.contains("_ntd_wait_pane"), "_ntd_wait_pane helper should be emitted");
+        assert!(
+            s.contains("_ntd_wait_pane"),
+            "_ntd_wait_pane helper should be emitted"
+        );
     }
 
     #[test]
@@ -965,7 +1025,10 @@ mod tests {
                         command: Some("npm start".into()),
                         focus: false,
                         title: None,
-                        wait_for: Some(WaitFor { pattern: "listening".into(), timeout: 5 }),
+                        wait_for: Some(WaitFor {
+                            pattern: "listening".into(),
+                            timeout: 5,
+                        }),
                     }),
                 },
             }],

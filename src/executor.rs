@@ -1,6 +1,6 @@
 use crate::backend::TmuxBackend;
-use crate::model::{Direction, LayoutNode, Session, WaitFor, Window};
 use crate::model::resolve_vars;
+use crate::model::{Direction, LayoutNode, Session, WaitFor, Window};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -60,18 +60,25 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
         vars: &HashMap<String, String>,
     ) -> Result<()> {
         let root = resolve_vars(
-            window.root.as_deref().or(session.root.as_deref()).unwrap_or("$HOME"),
+            window
+                .root
+                .as_deref()
+                .or(session.root.as_deref())
+                .unwrap_or("$HOME"),
             vars,
         );
 
         let initial = if index == 0 {
-            let p = self.backend.new_session(&session.name, &root, &window.name)?;
+            let p = self
+                .backend
+                .new_session(&session.name, &root, &window.name)?;
             for (k, v) in &session.options {
                 self.backend.set_option(&session.name, k, v)?;
             }
             p
         } else {
-            self.backend.new_window(&session.name, &window.name, &root)?
+            self.backend
+                .new_window(&session.name, &window.name, &root)?
         };
 
         // Phase 1: build pane structure
@@ -96,10 +103,12 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
         }
 
         for (k, v) in &window.options {
-            self.backend.set_window_option(&session.name, &window.name, k, v)?;
+            self.backend
+                .set_window_option(&session.name, &window.name, k, v)?;
         }
         if let Some(preset) = &window.select_layout {
-            self.backend.select_layout(&session.name, &window.name, preset)?;
+            self.backend
+                .select_layout(&session.name, &window.name, preset)?;
         }
         if let Some(fp) = focus_pane {
             self.backend.select_pane(&fp)?;
@@ -116,7 +125,12 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
         records: &mut Vec<PaneRecord>,
     ) -> Result<()> {
         match node {
-            LayoutNode::Pane { command, focus, title, wait_for } => {
+            LayoutNode::Pane {
+                command,
+                focus,
+                title,
+                wait_for,
+            } => {
                 records.push(PaneRecord {
                     id: current.to_string(),
                     command: command.as_ref().map(|c| resolve_vars(c, vars)),
@@ -125,7 +139,12 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
                     wait_for: wait_for.clone(),
                 });
             }
-            LayoutNode::Split { direction, ratio, first, second } => {
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
                 let flag = match direction {
                     Direction::Horizontal => "-h",
                     Direction::Vertical => "-v",
@@ -201,7 +220,9 @@ mod tests {
         let calls = b.calls();
         assert!(calls.iter().any(|c| c.starts_with("has-session:")));
         assert!(calls.iter().any(|c| c.starts_with("new-session:")));
-        assert!(calls.iter().any(|c| c.starts_with("send-keys:") && c.contains("vim")));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("send-keys:") && c.contains("vim")));
         assert!(calls.iter().any(|c| c.starts_with("select-window:")));
         assert!(calls.iter().any(|c| c.starts_with("attach-or-switch:")));
     }
@@ -244,9 +265,18 @@ mod tests {
         ex.run(&session).unwrap();
 
         let calls = b.calls();
-        let last_split = calls.iter().rposition(|c| c.starts_with("split-window:")).unwrap();
-        let first_send = calls.iter().position(|c| c.starts_with("send-keys:")).unwrap();
-        assert!(last_split < first_send, "all splits must precede all send-keys");
+        let last_split = calls
+            .iter()
+            .rposition(|c| c.starts_with("split-window:"))
+            .unwrap();
+        let first_send = calls
+            .iter()
+            .position(|c| c.starts_with("send-keys:"))
+            .unwrap();
+        assert!(
+            last_split < first_send,
+            "all splits must precede all send-keys"
+        );
     }
 
     #[test]
@@ -319,8 +349,14 @@ mod tests {
         ex.reload(&session).unwrap();
 
         let calls = b.calls();
-        let kill_pos = calls.iter().position(|c| c.starts_with("kill-session:")).unwrap();
-        let new_pos = calls.iter().position(|c| c.starts_with("new-session:")).unwrap();
+        let kill_pos = calls
+            .iter()
+            .position(|c| c.starts_with("kill-session:"))
+            .unwrap();
+        let new_pos = calls
+            .iter()
+            .position(|c| c.starts_with("new-session:"))
+            .unwrap();
         assert!(kill_pos < new_pos, "kill-session must precede new-session");
     }
 
@@ -461,7 +497,9 @@ mod tests {
 
         let calls = b.calls();
         assert!(
-            calls.iter().any(|c| c == "set-window-option:s:w:synchronize-panes:on"),
+            calls
+                .iter()
+                .any(|c| c == "set-window-option:s:w:synchronize-panes:on"),
             "set-window-option should be called for window options"
         );
     }
@@ -565,7 +603,9 @@ mod tests {
 
         let calls = b.calls();
         assert!(
-            calls.iter().any(|c| c == "send-keys:%0:cd /home/user/project"),
+            calls
+                .iter()
+                .any(|c| c == "send-keys:%0:cd /home/user/project"),
             "template variable should be substituted in command"
         );
     }
@@ -723,8 +763,14 @@ mod tests {
         ex.run(&session).unwrap();
 
         let calls = b.calls();
-        let hook_pos = calls.iter().position(|c| c == "run-command:nix build").unwrap();
-        let sess_pos = calls.iter().position(|c| c.starts_with("new-session:")).unwrap();
+        let hook_pos = calls
+            .iter()
+            .position(|c| c == "run-command:nix build")
+            .unwrap();
+        let sess_pos = calls
+            .iter()
+            .position(|c| c.starts_with("new-session:"))
+            .unwrap();
         assert!(hook_pos < sess_pos, "pre_hook must run before new-session");
     }
 
@@ -836,13 +882,23 @@ mod tests {
         let result = ex.run(&session);
         assert!(result.is_err());
         // Two capture-pane calls should have been recorded (one per iteration)
-        let capture_count = b.calls().iter().filter(|c| c.starts_with("capture-pane:")).count();
-        assert_eq!(capture_count, 2, "should attempt exactly timeout iterations");
+        let capture_count = b
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("capture-pane:"))
+            .count();
+        assert_eq!(
+            capture_count, 2,
+            "should attempt exactly timeout iterations"
+        );
     }
 
     // Suppress unused import warning for EnvVar in this test module
     #[allow(dead_code)]
     fn _use_env_var() -> EnvVar {
-        EnvVar { key: "K".into(), value: "V".into() }
+        EnvVar {
+            key: "K".into(),
+            value: "V".into(),
+        }
     }
 }

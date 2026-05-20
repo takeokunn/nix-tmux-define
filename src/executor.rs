@@ -30,14 +30,18 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
             return self.backend.attach_or_switch(&session.name);
         }
         self.create_session(session)?;
-        self.backend.select_window(&session.name, 0)?;
+        if let Some(first) = session.windows.first() {
+            self.backend.select_window(&session.name, &first.name)?;
+        }
         self.backend.attach_or_switch(&session.name)
     }
 
     pub fn reload(&self, session: &Session) -> Result<()> {
         let _ = self.backend.kill_session(&session.name);
         self.create_session(session)?;
-        self.backend.select_window(&session.name, 0)?;
+        if let Some(first) = session.windows.first() {
+            self.backend.select_window(&session.name, &first.name)?;
+        }
         self.backend.attach_or_switch(&session.name)
     }
 

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::cell::{Cell, RefCell};
+use std::process::Stdio;
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
@@ -14,7 +15,7 @@ pub trait TmuxBackend {
     fn set_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn set_window_option(&self, session: &str, window: &str, key: &str, value: &str) -> Result<()>;
     fn select_layout(&self, session: &str, window: &str, preset: &str) -> Result<()>;
-    fn select_window(&self, session: &str, index: usize) -> Result<()>;
+    fn select_window(&self, session: &str, window: &str) -> Result<()>;
     fn attach_or_switch(&self, session: &str) -> Result<()>;
     fn kill_session(&self, name: &str) -> Result<()>;
     fn capture_pane(&self, pane_id: &str) -> Result<String>;
@@ -31,6 +32,7 @@ impl TmuxBackend for RealTmux {
     fn has_session(&self, name: &str) -> bool {
         std::process::Command::new("tmux")
             .args(["has-session", "-t", name])
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -137,8 +139,8 @@ impl TmuxBackend for RealTmux {
         Ok(())
     }
 
-    fn select_window(&self, session: &str, index: usize) -> Result<()> {
-        let target = format!("{}:{}", session, index);
+    fn select_window(&self, session: &str, window: &str) -> Result<()> {
+        let target = format!("{}:{}", session, window);
         std::process::Command::new("tmux")
             .args(["select-window", "-t", &target])
             .status()?;
@@ -274,8 +276,8 @@ impl TmuxBackend for RecordingBackend {
         Ok(())
     }
 
-    fn select_window(&self, session: &str, index: usize) -> Result<()> {
-        self.record(format!("select-window:{}:{}", session, index));
+    fn select_window(&self, session: &str, window: &str) -> Result<()> {
+        self.record(format!("select-window:{}:{}", session, window));
         Ok(())
     }
 
@@ -402,8 +404,8 @@ mod tests {
     #[test]
     fn recording_backend_select_window() {
         let b = RecordingBackend::new();
-        b.select_window("s", 2).unwrap();
-        assert!(b.calls().iter().any(|c| c == "select-window:s:2"));
+        b.select_window("s", "main").unwrap();
+        assert!(b.calls().iter().any(|c| c == "select-window:s:main"));
     }
 
     #[test]

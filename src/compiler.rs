@@ -42,7 +42,7 @@ impl Compiler {
         for (idx, window) in session.windows.iter().enumerate() {
             self.compile_window(window, idx, session);
         }
-        self.emit("tmux select-window -t \"$SESSION:0\"");
+        self.emit("tmux select-window -t \"$SESSION:^\"");
         self.emit_attach_or_switch();
     }
 

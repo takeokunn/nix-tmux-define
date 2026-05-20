@@ -2,10 +2,55 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ─── Validators ──────────────────────────────────────────────────────────────
+
+fn deserialize_env_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s = String::deserialize(deserializer)?;
+    if s.is_empty() {
+        return Err(D::Error::custom("env var key must not be empty"));
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(D::Error::custom(format!(
+            "invalid env var key {s:?}: must start with ASCII letter or underscore"
+        )));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(D::Error::custom(format!(
+            "invalid env var key {s:?}: must contain only ASCII letters, digits, or underscores"
+        )));
+    }
+    Ok(s)
+}
+
+fn deserialize_tmux_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s = String::deserialize(deserializer)?;
+    if s.is_empty() {
+        return Err(D::Error::custom("tmux name must not be empty"));
+    }
+    // ':' separates session:window and '.' separates window.pane in tmux targets
+    if let Some(ch) = s.chars().find(|&c| c == ':' || c == '.') {
+        return Err(D::Error::custom(format!(
+            "invalid tmux name {s:?}: must not contain {ch:?} (tmux target separator)"
+        )));
+    }
+    Ok(s)
+}
+
 // ─── Model ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct Session {
+    #[serde(deserialize_with = "deserialize_tmux_name")]
     pub name: String,
     /// Default working directory for all panes; falls back to `$HOME`
     pub root: Option<String>,
@@ -24,6 +69,7 @@ pub struct Session {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct Window {
+    #[serde(deserialize_with = "deserialize_tmux_name")]
     pub name: String,
     pub layout: LayoutNode,
     /// Working directory for this window; overrides the session root when set
@@ -39,6 +85,7 @@ pub struct Window {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct EnvVar {
+    #[serde(deserialize_with = "deserialize_env_key")]
     pub key: String,
     pub value: String,
 }
@@ -176,5 +223,128 @@ mod tests {
         let vars = HashMap::new();
         let result = resolve_vars("echo {{git_branch}}", &vars);
         assert_eq!(result, "echo $(git rev-parse --abbrev-ref HEAD)");
+    }
+
+    // ── EnvVar key validation ─────────────────────────────────────────────────
+
+    fn parse_env_key(key: &str) -> Result<EnvVar, serde_json::Error> {
+        serde_json::from_str(&format!(r#"{{"key":"{key}","value":"v"}}"#))
+    }
+
+    #[test]
+    fn env_key_valid_simple() {
+        let ev = parse_env_key("FOO_BAR").unwrap();
+        assert_eq!(ev.key, "FOO_BAR");
+    }
+
+    #[test]
+    fn env_key_valid_starts_with_underscore() {
+        let ev = parse_env_key("_MY_VAR").unwrap();
+        assert_eq!(ev.key, "_MY_VAR");
+    }
+
+    #[test]
+    fn env_key_valid_lowercase() {
+        assert!(parse_env_key("my_var").is_ok());
+    }
+
+    #[test]
+    fn env_key_invalid_starts_with_digit() {
+        let err = parse_env_key("1FOO").unwrap_err();
+        assert!(err.to_string().contains("must start with"), "{err}");
+    }
+
+    #[test]
+    fn env_key_invalid_contains_semicolon() {
+        let err = parse_env_key("FOO;rm -rf /").unwrap_err();
+        assert!(err.to_string().contains("must contain only"), "{err}");
+    }
+
+    #[test]
+    fn env_key_invalid_contains_dollar() {
+        assert!(parse_env_key("FOO$BAR").is_err());
+    }
+
+    #[test]
+    fn env_key_invalid_empty() {
+        assert!(parse_env_key("").is_err());
+    }
+
+    // ── tmux name validation ──────────────────────────────────────────────────
+
+    fn parse_session_name(name: &str) -> Result<Session, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"name":"{name}","windows":[{{"name":"w","layout":{{"type":"pane"}}}}]}}"#
+        ))
+    }
+
+    fn parse_window_name(name: &str) -> Result<Session, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"name":"s","windows":[{{"name":"{name}","layout":{{"type":"pane"}}}}]}}"#
+        ))
+    }
+
+    #[test]
+    fn session_name_valid() {
+        assert!(parse_session_name("my-session").is_ok());
+    }
+
+    #[test]
+    fn session_name_invalid_colon() {
+        let err = parse_session_name("my:session").unwrap_err();
+        assert!(err.to_string().contains("':'"), "{err}");
+    }
+
+    #[test]
+    fn session_name_invalid_empty() {
+        assert!(parse_session_name("").is_err());
+    }
+
+    #[test]
+    fn window_name_valid() {
+        assert!(parse_window_name("editor").is_ok());
+    }
+
+    #[test]
+    fn window_name_invalid_colon() {
+        let err = parse_window_name("win:one").unwrap_err();
+        assert!(err.to_string().contains("':'"), "{err}");
+    }
+
+    #[test]
+    fn session_name_invalid_dot() {
+        let err = parse_session_name("my.session").unwrap_err();
+        assert!(err.to_string().contains("'.'"), "{err}");
+    }
+
+    #[test]
+    fn window_name_invalid_dot() {
+        assert!(parse_window_name("win.sub").is_err());
+    }
+
+    #[test]
+    fn session_name_allows_hyphen_and_space() {
+        assert!(parse_session_name("my-session").is_ok());
+        assert!(parse_session_name("my session").is_ok());
+    }
+
+    #[test]
+    fn env_key_invalid_hyphen() {
+        assert!(parse_env_key("FOO-BAR").is_err());
+    }
+
+    #[test]
+    fn env_key_invalid_dot() {
+        assert!(parse_env_key("FOO.BAR").is_err());
+    }
+
+    #[test]
+    fn env_key_invalid_space() {
+        assert!(parse_env_key("FOO BAR").is_err());
+    }
+
+    #[test]
+    fn env_key_single_underscore_is_valid() {
+        assert!(parse_env_key("_").is_ok());
     }
 }

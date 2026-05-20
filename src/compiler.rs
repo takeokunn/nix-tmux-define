@@ -1,5 +1,6 @@
 use crate::model::{resolve_vars, shell_quote};
 use crate::model::{Direction, LayoutNode, Session, Window};
+use anyhow::Result;
 
 // ─── Internal record ─────────────────────────────────────────────────────────
 
@@ -34,16 +35,17 @@ impl Compiler {
         Self::default()
     }
 
-    pub fn compile(&mut self, session: &Session) {
+    pub fn compile(&mut self, session: &Session) -> Result<()> {
         // Check whether any pane uses wait_for so we can emit the helper
         let needs_wait_helper = self.session_uses_wait_for(session);
 
         self.emit_preamble(session, needs_wait_helper);
         for (idx, window) in session.windows.iter().enumerate() {
-            self.compile_window(window, idx, session);
+            self.compile_window(window, idx, session)?;
         }
         self.emit("tmux select-window -t \"$SESSION:^\"");
         self.emit_attach_or_switch();
+        Ok(())
     }
 
     pub fn into_script(self) -> String {
@@ -83,7 +85,7 @@ impl Compiler {
         self.emit("_ntd_wait_pane() {");
         self.emit("  local pane=$1 pattern=$2 timeout=${3:-30} elapsed=0");
         self.emit("  while [ $elapsed -lt $timeout ]; do");
-        self.emit("    if tmux capture-pane -t \"$pane\" -p | grep -q \"$pattern\"; then");
+        self.emit("    if tmux capture-pane -t \"$pane\" -p | grep -qF \"$pattern\"; then");
         self.emit("      return 0");
         self.emit("    fi");
         self.emit("    sleep 1");
@@ -139,7 +141,7 @@ impl Compiler {
         self.emit("fi");
     }
 
-    fn compile_window(&mut self, window: &Window, index: usize, session: &Session) {
+    fn compile_window(&mut self, window: &Window, index: usize, session: &Session) -> Result<()> {
         let root = resolve_vars(
             window
                 .root
@@ -185,7 +187,7 @@ impl Compiler {
         };
 
         let mut records: Vec<PaneRecord> = Vec::new();
-        self.collect_structure(&window.layout, &initial, &root, &session.vars, &mut records);
+        self.collect_structure(&window.layout, &initial, &root, &session.vars, &mut records, 0)?;
 
         // ── Phase 2: send commands and configure panes ───────────────────────
         let mut focus_var: Option<String> = None;
@@ -243,6 +245,7 @@ impl Compiler {
         }
 
         self.emit("");
+        Ok(())
     }
 
     /// Recursively emits `split-window` commands (phase 1) and appends a
@@ -254,7 +257,14 @@ impl Compiler {
         root: &str,
         vars: &std::collections::HashMap<String, String>,
         records: &mut Vec<PaneRecord>,
-    ) {
+        depth: usize,
+    ) -> Result<()> {
+        if depth > crate::MAX_LAYOUT_DEPTH {
+            anyhow::bail!(
+                "layout tree is too deeply nested (max depth: {})",
+                crate::MAX_LAYOUT_DEPTH
+            );
+        }
         match node {
             LayoutNode::Pane {
                 command,
@@ -293,10 +303,11 @@ impl Compiler {
                     pct,
                     shell_quote(root),
                 ));
-                self.collect_structure(first, current, root, vars, records);
-                self.collect_structure(second, &new_pane, root, vars, records);
+                self.collect_structure(first, current, root, vars, records, depth + 1)?;
+                self.collect_structure(second, &new_pane, root, vars, records, depth + 1)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -311,7 +322,7 @@ mod tests {
 
     fn compile(session: &Session) -> String {
         let mut c = Compiler::new();
-        c.compile(session);
+        c.compile(session).unwrap();
         c.into_script()
     }
 
@@ -1075,5 +1086,95 @@ mod tests {
             s.contains("cd /home/user/project"),
             "template variable should be substituted"
         );
+    }
+
+    // ── Security: grep -qF ───────────────────────────────────────────────────
+
+    #[test]
+    fn compiler_wait_helper_uses_grep_fixed_string() {
+        use crate::model::WaitFor;
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: Some(WaitFor {
+                        pattern: "ready".into(),
+                        timeout: 5,
+                    }),
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let s = compile(&session);
+        assert!(
+            s.contains("grep -qF"),
+            "wait helper must use grep -qF (fixed string) not grep -q (regex)"
+        );
+        assert!(!s.contains("grep -q \""), "grep -q with unquoted pattern is absent");
+    }
+
+    // ── Security: recursion depth limit ──────────────────────────────────────
+
+    #[test]
+    fn compiler_depth_limit_rejects_oversized_tree() {
+        use crate::test_fixtures::make_deeply_nested;
+        let session = Session {
+            name: "s".into(),
+            root: None,
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: make_deeply_nested(65),
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let mut c = Compiler::new();
+        let result = c.compile(&session);
+        assert!(result.is_err(), "should fail for depth > MAX_LAYOUT_DEPTH");
+        assert!(
+            result.unwrap_err().to_string().contains("deeply nested"),
+            "error should mention nesting"
+        );
+    }
+
+    #[test]
+    fn compiler_depth_limit_accepts_depth_64() {
+        use crate::test_fixtures::make_deeply_nested;
+        let session = Session {
+            name: "s".into(),
+            root: None,
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: make_deeply_nested(64),
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let mut c = Compiler::new();
+        assert!(c.compile(&session).is_ok(), "depth 64 should be accepted");
     }
 }

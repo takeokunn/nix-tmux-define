@@ -87,7 +87,7 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
 
         // Phase 1: build pane structure
         let mut records = Vec::new();
-        self.collect_structure(&window.layout, &initial, &root, vars, &mut records)?;
+        self.collect_structure(&window.layout, &initial, &root, vars, &mut records, 0)?;
 
         // Phase 2: send commands / titles / wait_for
         let mut focus_pane: Option<String> = None;
@@ -127,7 +127,14 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
         root: &str,
         vars: &HashMap<String, String>,
         records: &mut Vec<PaneRecord>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > crate::MAX_LAYOUT_DEPTH {
+            anyhow::bail!(
+                "layout tree is too deeply nested (max depth: {})",
+                crate::MAX_LAYOUT_DEPTH
+            );
+        }
         match node {
             LayoutNode::Pane {
                 command,
@@ -155,8 +162,8 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
                 };
                 let pct = ((1.0 - ratio).clamp(0.0, 1.0) * 100.0).round() as u32;
                 let new_pane = self.backend.split_window(current, flag, pct, root)?;
-                self.collect_structure(first, current, root, vars, records)?;
-                self.collect_structure(second, &new_pane, root, vars, records)?;
+                self.collect_structure(first, current, root, vars, records, depth + 1)?;
+                self.collect_structure(second, &new_pane, root, vars, records, depth + 1)?;
             }
         }
         Ok(())
@@ -904,5 +911,60 @@ mod tests {
             key: "K".into(),
             value: "V".into(),
         }
+    }
+
+    // ── Security: recursion depth limit ──────────────────────────────────────
+
+    #[test]
+    fn executor_depth_limit_rejects_oversized_tree() {
+        use crate::test_fixtures::make_deeply_nested;
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: make_deeply_nested(65),
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        let result = ex.run(&session);
+        assert!(result.is_err(), "should fail for depth > MAX_LAYOUT_DEPTH");
+        assert!(
+            result.unwrap_err().to_string().contains("deeply nested"),
+            "error should mention nesting"
+        );
+    }
+
+    #[test]
+    fn executor_depth_limit_accepts_depth_64() {
+        use crate::test_fixtures::make_deeply_nested;
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: "s".into(),
+            root: Some("/tmp".into()),
+            windows: vec![Window {
+                name: "w".into(),
+                root: None,
+                env: vec![],
+                options: HashMap::new(),
+                select_layout: None,
+                layout: make_deeply_nested(64),
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: HashMap::new(),
+            vars: HashMap::new(),
+        };
+        let ex = Executor::new(&b);
+        assert!(ex.run(&session).is_ok(), "depth 64 should be accepted");
     }
 }

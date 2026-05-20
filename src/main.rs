@@ -65,10 +65,10 @@ enum Command {
     },
 }
 
-fn generate(session: &Session) -> String {
+fn generate(session: &Session) -> Result<String> {
     let mut compiler = Compiler::new();
-    compiler.compile(session);
-    compiler.into_script()
+    compiler.compile(session)?;
+    Ok(compiler.into_script())
 }
 
 fn session_running(name: &str) -> bool {
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn generate_returns_bash_script() {
         let s = make_session("test", 1);
-        let script = generate(&s);
+        let script = generate(&s).unwrap();
         assert!(script.starts_with("#!/usr/bin/env bash"));
         assert!(script.contains("tmux new-session"));
     }
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
 
         Command::Print { config } => {
             let session = load_session(&config)?;
-            print!("{}", generate(&session));
+            print!("{}", generate(&session)?);
         }
 
         Command::Validate { config } => {

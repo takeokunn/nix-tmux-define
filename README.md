@@ -21,29 +21,54 @@ Define your tmux workspace once in Nix (or JSON) and reproduce it instantly — 
 
 ### Architecture
 
-```
-User (Nix AttrSet)
-      │  programs.nix-tmux-define.sessions.myproject = { ... };
-      ▼
-module.nix — builtins.toJSON → JSON file (Nix store)
-      │
-      ▼
-nix-tmux-define print --config /nix/store/…-session.json
-      │
-      ▼
-Generated bash script (stdout)
-      │  #!/usr/bin/env bash
-      │  PANE_0=$(tmux new-session …)
-      │  PANE_1=$(tmux split-window …)
-      │  tmux send-keys -t "${PANE_0}" 'nvim .' Enter
-      │  …
-      ▼
-tmux session
+```mermaid
+flowchart TD
+    subgraph NixLayer["Nix / Home Manager layer"]
+        HMConfig["home.nix\nprograms.nix-tmux-define.sessions.*"]
+        ModuleNix["module.nix\nbuiltins.toJSON"]
+        JSONStore["/nix/store/…-session.json"]
+        ShellScript["tmux-session-&lt;name&gt;\n(shell script in PATH)"]
+
+        HMConfig -->|"type-checked\nattrset"| ModuleNix
+        ModuleNix -->|"pkgs.writeText"| JSONStore
+        ModuleNix -->|"pkgs.writeShellScriptBin"| ShellScript
+    end
+
+    subgraph RustCLI["Rust CLI  (nix-tmux-define)"]
+        Format["format.rs\nload_session()\nJSON / TOML / YAML"]
+        Model["model.rs\nSession → Window → LayoutNode"]
+
+        subgraph PrintPath["print path"]
+            Compiler["compiler.rs\nCompiler\nDFS → bash text"]
+            BashScript["#!/usr/bin/env bash\nsplit-window …\nsend-keys …"]
+        end
+
+        subgraph RunPath["run / reload path"]
+            Executor["executor.rs\nExecutor"]
+            Backend["backend.rs\nTmuxBackend trait"]
+            RealTmux["RealTmux\n(production)"]
+            Recording["RecordingBackend\n(tests)"]
+        end
+
+        Format --> Model
+        Model --> Compiler
+        Compiler --> BashScript
+        Model --> Executor
+        Executor --> Backend
+        Backend --> RealTmux
+        Backend -.->|"test double"| Recording
+    end
+
+    ShellScript -->|"bash &lt;(CLI print --config JSON)"| Format
+    JSONStore -->|"--config PATH"| Format
+    BashScript -->|"exec bash"| Tmux[("tmux server")]
+    RealTmux -->|"tmux new-session\nsplit-window\nsend-keys"| Tmux
 ```
 
-The Rust CLI performs a **two-phase compilation**:
-1. **Structure phase** — emit all `split-window` commands (depth-first traversal of the layout tree).
-2. **Command phase** — emit `send-keys` / `select-pane` / pane titles after all panes exist.
+The Rust CLI has **two execution paths**:
+
+- **`print` path** — `Compiler` performs a two-phase depth-first traversal of the `LayoutNode` tree, emitting all `split-window` calls first (structure phase), then all `send-keys` / `select-pane` calls (command phase). The Home Manager module wraps this with `bash <(…)` process substitution.
+- **`run` / `reload` path** — `Executor` drives tmux directly via the `TmuxBackend` trait, bypassing the bash script entirely. `RecordingBackend` implements the same trait for unit tests without spawning a real tmux.
 
 This guarantees every pane is ready before any command is dispatched.
 

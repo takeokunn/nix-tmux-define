@@ -4,6 +4,7 @@ use nix_tmux_define::{
     load_session, load_sessions_from_dir, Compiler, Executor, RealTmux, Session,
 };
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 #[derive(Parser)]
 #[command(
@@ -73,6 +74,7 @@ fn generate(session: &Session) -> String {
 fn session_running(name: &str) -> bool {
     std::process::Command::new("tmux")
         .args(["has-session", "-t", name])
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

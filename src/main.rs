@@ -24,6 +24,9 @@ enum Command {
         /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
+        /// Kill the tmux server before creating the session (wipes all sessions)
+        #[arg(long, short = 'k')]
+        kill_server: bool,
     },
 
     /// Print the generated bash script to stdout without executing
@@ -150,7 +153,14 @@ mod tests {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config } => {
+        Command::Run { config, kill_server } => {
+            if kill_server {
+                std::process::Command::new("tmux")
+                    .args(["kill-server"])
+                    .stderr(Stdio::null())
+                    .status()
+                    .ok();
+            }
             let session = load_session(&config)?;
             let backend = RealTmux;
             let executor = Executor::new(&backend);

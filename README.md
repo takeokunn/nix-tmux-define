@@ -147,7 +147,32 @@ programs.nix-tmux-define = {
 After `home-manager switch`, a `tmux-session-dev` command appears in your PATH:
 
 ```bash
-tmux-session-dev        # create session (or reattach if it exists)
+tmux-session-dev            # create session (or reattach if it exists)
+tmux-session-dev --reload   # kill tmux server, then create a fresh session
+tmux-session-dev -r         # shorthand for --reload
+```
+
+### Dynamically generating sessions
+
+Because `sessions` is a plain Nix `attrsOf`, you can generate entries with `map` and `lib.listToAttrs`:
+
+```nix
+let
+  profiles = [
+    { name = "api";     root = "~/src/api"; }
+    { name = "frontend"; root = "~/src/frontend"; }
+  ];
+in {
+  programs.nix-tmux-define.sessions =
+    lib.listToAttrs (map (p: lib.nameValuePair p.name {
+      name = p.name;
+      root = p.root;
+      windows = [{
+        name   = "main";
+        layout = { type = "pane"; command = "nvim ."; focus = true; };
+      }];
+    }) profiles);
+}
 ```
 
 ---
@@ -164,6 +189,8 @@ The Rust CLI accepts a JSON file that maps 1:1 to the Nix schema above.
   "root":     "/home/user/src/proj",  // default working dir (optional)
   "env":      [{ "key": "K", "value": "V" }],  // session-level exports
   "pre_hook": "nix build",            // runs before new-session
+  "options":  { "status": "off" },    // tmux set-option key/value pairs
+  "vars":     { "proj": "/home/user/src" },     // template variables
   "windows":  [ /* Window[] */ ]
 }
 ```
@@ -172,10 +199,12 @@ The Rust CLI accepts a JSON file that maps 1:1 to the Nix schema above.
 
 ```jsonc
 {
-  "name":   "main",
-  "root":   "/override",   // overrides session root for this window
-  "env":    [],            // window-scoped exports
-  "layout": /* LayoutNode */
+  "name":          "main",
+  "root":          "/override",   // overrides session root for this window
+  "env":           [],            // window-scoped exports
+  "options":       { "synchronize-panes": "on" },  // tmux set-window-option
+  "select_layout": "tiled",       // apply a tmux layout preset (optional)
+  "layout":        /* LayoutNode */
 }
 ```
 
@@ -183,10 +212,14 @@ The Rust CLI accepts a JSON file that maps 1:1 to the Nix schema above.
 
 ```jsonc
 {
-  "type":    "pane",
-  "command": "nvim .",     // sent via send-keys (optional)
-  "focus":   true,         // move focus here after setup (default: false)
-  "title":   "editor"      // select-pane -T (optional)
+  "type":     "pane",
+  "command":  "nvim .",     // sent via send-keys (optional)
+  "focus":    true,         // move focus here after setup (default: false)
+  "title":    "editor",     // select-pane -T (optional)
+  "wait_for": {             // block until pattern appears in pane output
+    "pattern": "ready",
+    "timeout": 30           // seconds (default: 30)
+  }
 }
 ```
 
@@ -205,6 +238,19 @@ The Rust CLI accepts a JSON file that maps 1:1 to the Nix schema above.
 > **`direction` semantics**
 > - `horizontal` → side-by-side panes (`split-window -h`)
 > - `vertical`   → top/bottom panes (`split-window -v`)
+
+### Template variables
+
+Use `{{key}}` placeholders in `command` and `root` values.
+Built-in variables are always available:
+
+| Placeholder | Expands to |
+|---|---|
+| `{{cwd}}` | `$PWD` at session-start time |
+| `{{date}}` | `$(date +%Y-%m-%d)` |
+| `{{git_branch}}` | `$(git rev-parse --abbrev-ref HEAD)` |
+
+User-defined variables go in the `vars` map at session level.
 
 ### Full example
 
@@ -242,15 +288,37 @@ The Rust CLI accepts a JSON file that maps 1:1 to the Nix schema above.
 nix-tmux-define <COMMAND>
 
 Commands:
-  run          Generate and execute the session script
-  print        Print the bash script to stdout (dry-run)
+  run          Start a tmux session from a config file
+  print        Print the generated bash script to stdout (dry-run)
+  reload       Kill and re-create a session from a config file
   validate     Parse a config and report errors
-  completions  Emit shell completions
+  list         List all sessions from config files
+  schema       Print the JSON Schema for the session config format
+  completions  Emit shell completion scripts
 
 Options:
   -h, --help     Print help
   -V, --version  Print version
 ```
+
+### `run`
+
+```
+nix-tmux-define run --config <PATH> [--kill-server]
+
+Options:
+  --config <PATH>   Path to the session config (JSON, TOML, or YAML)
+  -k, --kill-server Kill the tmux server before creating the session
+                    (wipes all sessions, then creates this one fresh)
+```
+
+### `reload`
+
+```
+nix-tmux-define reload --config <PATH>
+```
+
+Kills only the named session, then recreates it. Use `run --kill-server` to wipe the entire server first.
 
 ### Examples
 
@@ -258,11 +326,20 @@ Options:
 # Dry-run — inspect the generated script
 nix-tmux-define print --config session.json
 
-# Execute
+# Create session (or reattach if already running)
 nix-tmux-define run --config session.json
 
-# Validate without creating any session
+# Wipe all tmux sessions, then create this one fresh
+nix-tmux-define run --config session.json --kill-server
+
+# Kill only this session and recreate it
+nix-tmux-define reload --config session.json
+
+# Validate config without touching tmux
 nix-tmux-define validate --config session.json
+
+# List sessions in current directory
+nix-tmux-define list
 
 # Install fish completions
 nix-tmux-define completions fish > ~/.config/fish/completions/nix-tmux-define.fish
@@ -310,10 +387,15 @@ nix flake check
 ```
 nix-tmux-define/
 ├── src/
-│   ├── lib.rs       # model types, Compiler, shell_quote, tests
-│   └── main.rs      # CLI entry point (clap subcommands)
-├── flake.nix        # packages, apps, devShell, checks, homeManagerModules
-├── module.nix       # Home Manager option definitions
+│   ├── lib.rs        # public API surface
+│   ├── main.rs       # CLI entry point (clap subcommands)
+│   ├── model.rs      # Session / Window / LayoutNode types + serde
+│   ├── compiler.rs   # Compiler: Session → bash script (print path)
+│   ├── executor.rs   # Executor: Session → live tmux calls (run path)
+│   ├── backend.rs    # TmuxBackend trait + RealTmux + RecordingBackend
+│   └── format.rs     # load_session(): JSON / TOML / YAML deserialization
+├── flake.nix         # packages, apps, devShell, checks, homeManagerModules
+├── module.nix        # Home Manager option definitions
 └── Cargo.toml
 ```
 
@@ -325,7 +407,7 @@ Bug reports and pull requests are welcome.
 
 1. Fork the repository
 2. `nix develop` to enter the dev shell
-3. Make changes and add tests in `src/lib.rs`
+3. Make changes and add tests
 4. `cargo test && cargo clippy` must pass
 5. Open a PR — CI runs `nix flake check` automatically
 

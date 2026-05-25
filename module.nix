@@ -161,7 +161,14 @@ let
       );
     in
     pkgs.writeShellScriptBin "tmux-session-${sessionCfg.name}" ''
-      exec bash <(${cliPkg}/bin/nix-tmux-define print --config ${jsonFile}) "$@"
+      case "''${1:-}" in
+        --reload|-r)
+          exec ${cliPkg}/bin/nix-tmux-define run --config ${jsonFile} --kill-server
+          ;;
+        *)
+          exec bash <(${cliPkg}/bin/nix-tmux-define print --config ${jsonFile})
+          ;;
+      esac
     '';
 
 in

@@ -1,0 +1,55 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- `examples/` directory with ready-to-run JSON, TOML, and YAML session configs.
+- Community health files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`,
+  issue templates, and a pull-request template.
+- Crate-level documentation and a `CHANGELOG.md`.
+- Convenience constructors `LayoutNode::pane()` / `command()` / `split()` and a
+  `Default` impl.
+- Boundary validation: split `ratio` must be finite and strictly within
+  `(0.0, 1.0)`, and a session must define at least one window — both rejected at
+  parse time across JSON/TOML/YAML.
+- Tiered test layout: `tests/unit/` (proptest property tests), `tests/integration/`
+  (the real tmux backend, isolated via `TMUX_TMPDIR`), and `tests/e2e/` (the
+  compiled binary). The `RealTmux` backend is now covered end-to-end.
+
+### Changed
+- CI now runs entirely through Nix: `nix flake check` enforces build, tests,
+  clippy (`-D warnings`), rustfmt, nixfmt, actionlint, and example validation as
+  flake checks, so local and CI results cannot diverge.
+- Dependabot keeps Cargo dependencies and GitHub Actions up to date.
+
+### Fixed
+- **The `run` / `reload` path now applies `env` and per-window `env`.** Previously
+  only the `print` (compiler) path exported them, so starting a session via the
+  executor — including the Home Manager `--reload` wrapper — silently dropped all
+  configured environment variables.
+- **The generated script no longer aborts when a window sets `options` or
+  `select_layout`.** The compiler had embedded literal quotes in the tmux target
+  (`"$SESSION:'name'"`), which tmux rejected as a nonexistent window, killing the
+  `set -euo pipefail` script before it attached.
+- Resolved a `clippy::items_after_test_module` lint in `src/main.rs` and applied
+  `cargo fmt` across the tree.
+
+## [0.1.0]
+
+### Added
+- Initial release: declarative tmux session manager driven by JSON / TOML / YAML
+  or a Home Manager module.
+- Two execution paths: `print` (compile to a bash script) and `run` / `reload`
+  (drive tmux directly via the `TmuxBackend` trait).
+- Recursive split layouts, per-window/session env vars and options, `pre_hook`,
+  template variables (`{{cwd}}`, `{{date}}`, `{{git_branch}}`, and user-defined),
+  `wait_for`, `select_layout`, and shell completions.
+- Home Manager module generating `tmux-session-<name>` commands.
+
+[Unreleased]: https://github.com/takeokunn/nix-tmux-define/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/takeokunn/nix-tmux-define/releases/tag/v0.1.0

@@ -93,11 +93,7 @@ impl Compiler {
 
         // Idempotency: reuse the existing session instead of failing
         self.emit("if tmux has-session -t \"$SESSION\" 2>/dev/null; then");
-        self.emit("  if [ -n \"${TMUX:-}\" ]; then");
-        self.emit("    exec tmux switch-client -t \"$SESSION\"");
-        self.emit("  else");
-        self.emit("    exec tmux attach-session -t \"$SESSION\"");
-        self.emit("  fi");
+        self.emit_attach_block("  ");
         self.emit("fi");
         self.emit("");
 
@@ -116,11 +112,33 @@ impl Compiler {
 
     /// Emits the final attach/switch block, handling nested-tmux correctly.
     fn emit_attach_or_switch(&mut self) {
-        self.emit("if [ -n \"${TMUX:-}\" ]; then");
-        self.emit("  exec tmux switch-client -t \"$SESSION\"");
-        self.emit("else");
-        self.emit("  exec tmux attach-session -t \"$SESSION\"");
-        self.emit("fi");
+        self.emit_attach_block("");
+    }
+
+    /// Emits the three-way attach decision shared by the idempotency guard and
+    /// the final attach, indented by `indent`. This mirrors
+    /// [`crate::backend::RealTmux::attach_or_switch`] exactly:
+    ///   - inside tmux (`$TMUX` set) → `switch-client` (works through the server);
+    ///   - otherwise, a terminal on stdin (`[ -t 0 ]`) → `attach-session`;
+    ///   - otherwise (headless: systemd, CI) → report and exit 0 without
+    ///     attaching, so a non-interactive caller does not fail on
+    ///     "open terminal failed: not a terminal".
+    fn emit_attach_block(&mut self, indent: &str) {
+        self.emit(format!("{indent}if [ -n \"${{TMUX:-}}\" ]; then"));
+        self.emit(format!("{indent}  exec tmux switch-client -t \"$SESSION\""));
+        self.emit(format!("{indent}elif [ -t 0 ]; then"));
+        self.emit(format!(
+            "{indent}  exec tmux attach-session -t \"$SESSION\""
+        ));
+        self.emit(format!("{indent}else"));
+        self.emit(format!(
+            "{indent}  echo \"nix-tmux-define: session '$SESSION' is ready (not attaching; no terminal).\" >&2"
+        ));
+        self.emit(format!(
+            "{indent}  echo \"nix-tmux-define: attach later with: tmux attach -t '$SESSION'\" >&2"
+        ));
+        self.emit(format!("{indent}  exit 0"));
+        self.emit(format!("{indent}fi"));
     }
 
     fn compile_window(&mut self, window: &Window, index: usize, session: &Session) -> Result<()> {
@@ -540,6 +558,24 @@ mod tests {
         assert_eq!(
             count, 2,
             "TMUX detection should appear in guard and final attach"
+        );
+    }
+
+    #[test]
+    fn script_attach_is_terminal_guarded() {
+        let s = compile(&single_pane("s", "bash"));
+        // The attach branch must be gated on a terminal so a headless caller
+        // (systemd oneshot / CI) builds the session and exits 0 instead of
+        // failing with "open terminal failed: not a terminal". Both the
+        // idempotency guard and the final attach share the same guard.
+        let guard_count = s.matches("elif [ -t 0 ]; then").count();
+        assert_eq!(
+            guard_count, 2,
+            "terminal guard should appear in idempotency block and final attach"
+        );
+        assert!(
+            s.contains("not attaching; no terminal"),
+            "headless branch should report the session is ready without attaching"
         );
     }
 

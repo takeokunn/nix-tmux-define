@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`run` / `reload` are now safe to invoke without a terminal** (e.g. from a
+  systemd oneshot or CI). Attaching is only attempted when a terminal is
+  available: inside tmux (`$TMUX` set) it `switch-client`s, with a terminal on
+  stdin it `attach-session`s, and otherwise it builds the session detached and
+  exits 0 with a note instead of failing on `open terminal failed: not a
+  terminal`. The decision is a pure, unit-tested `attach::resolve_attach_action`
+  shared in spirit by both the executor and the compiled `print` script (which
+  now emits the same `[ -t 0 ]` guard), preserving the two-path parity.
+- **`--no-attach` flag for `run` / `reload`** to build (or atomically reload) a
+  session without attaching or switching to it, even from a terminal — useful for
+  preseeding sessions in the background.
 - `examples/` directory with ready-to-run JSON, TOML, and YAML session configs.
 - Community health files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`,
   issue templates, and a pull-request template.

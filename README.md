@@ -338,6 +338,17 @@ By default, `list` only reads configuration files. Add `--running-status` to
 explicitly probe `tmux list-sessions` and append `[running]` to matching
 sessions.
 
+Directory scanning is strict where you ask for it and lenient where it is
+implicit:
+
+- With no `--config`/`--config-dir`, `list` scans the **current directory** as a
+  best-effort convenience. Config-extension files that are not session configs
+  (`Cargo.toml`, `package.json`, `tsconfig.json`, …) are skipped with a
+  `warning:` on stderr instead of aborting the command.
+- With an explicit `--config-dir <DIR>`, every `.json`/`.toml`/`.yaml`/`.yml`
+  file must parse and validate as a session; a malformed one is a hard error, so
+  problems in a directory you curated are surfaced rather than hidden.
+
 ### Examples
 
 ```bash

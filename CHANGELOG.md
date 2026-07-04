@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependabot keeps Cargo dependencies and GitHub Actions up to date.
 
 ### Fixed
+- **`list` no longer aborts on unrelated config files in the current directory.**
+  The implicit current-directory scan (running `list` with no `--config` /
+  `--config-dir`) previously failed outright when the directory held any
+  `.json`/`.toml`/`.yaml`/`.yml` file that was not a session config — e.g.
+  `Cargo.toml` or `package.json`, which are present in almost every project. Such
+  files are now skipped with a `warning:` on stderr. An explicitly requested
+  `--config-dir` stays strict and still errors on a malformed config.
 - **The `run` / `reload` path now applies `env` and per-window `env`.** Previously
   only the `print` (compiler) path exported them, so starting a session via the
   executor — including the Home Manager `--reload` wrapper — silently dropped all

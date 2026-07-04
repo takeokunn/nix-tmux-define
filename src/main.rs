@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use nix_tmux_define::{
-    load_session, load_sessions_from_dir, Compiler, Executor, RealTmux, Session, TmuxName,
+    load_session, load_sessions_from_dir, load_sessions_from_dir_lenient, Compiler, Executor,
+    RealTmux, Session, TmuxName,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -181,10 +182,24 @@ fn main() -> Result<()> {
                 sessions.push(load_session(p)?);
             }
             if let Some(dir) = &config_dir {
+                // An explicitly requested directory is strict: a malformed
+                // config there is an error the caller wants surfaced.
                 sessions.extend(load_sessions_from_dir(dir)?);
             }
             if configs.is_empty() && config_dir.is_none() {
-                sessions.extend(load_sessions_from_dir(Path::new("."))?);
+                // The implicit current-directory scan is best-effort: unrelated
+                // config-extension files (Cargo.toml, package.json, …) are
+                // expected here and must not abort the command. Skips are
+                // reported as warnings so nothing fails silently.
+                let scan = load_sessions_from_dir_lenient(Path::new("."))?;
+                for skipped in &scan.skipped {
+                    eprintln!(
+                        "warning: skipping '{}' ({})",
+                        skipped.path.display(),
+                        skipped.reason
+                    );
+                }
+                sessions.extend(scan.sessions);
             }
             let running = if running_status {
                 Some(running_sessions()?)

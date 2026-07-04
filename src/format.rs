@@ -1,6 +1,6 @@
 use crate::model::Session;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Load a session from a file, detecting format by extension.
 ///
@@ -26,16 +26,30 @@ pub fn load_session(path: &Path) -> Result<Session> {
     Ok(session)
 }
 
-/// Load all supported session configs from a directory.
+/// A directory config file that could not be loaded as a session, together with
+/// a concise, single-line reason. Produced by [`load_sessions_from_dir_lenient`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedConfig {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Result of a lenient directory scan: the sessions that loaded successfully,
+/// plus the config-extension files that were skipped and why.
+#[derive(Debug, Default)]
+pub struct LenientDirScan {
+    pub sessions: Vec<Session>,
+    pub skipped: Vec<SkippedConfig>,
+}
+
+/// Collects the config-extension files (`.json`, `.toml`, `.yaml`, `.yml`) that
+/// live directly in `dir`, sorted by path for deterministic ordering.
 ///
-/// Only `.json`, `.toml`, `.yaml`, and `.yml` files are considered.
 /// Extension-less files (e.g. `config`) are intentionally ignored even though
 /// `load_session()` would attempt JSON parsing for them; use `load_session()`
 /// directly when you need to load a file without a recognised extension.
-/// Supported config files must parse and validate successfully.
-/// The returned list is sorted by session name.
-pub fn load_sessions_from_dir(dir: &Path) -> Result<Vec<Session>> {
-    let mut sessions = Vec::new();
+fn config_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("cannot read directory '{}'", dir.display()))?;
     for entry in entries {
@@ -45,16 +59,72 @@ pub fn load_sessions_from_dir(dir: &Path) -> Result<Vec<Session>> {
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if matches!(ext, "json" | "toml" | "yaml" | "yml") {
-                    let session = load_session(&path).with_context(|| {
-                        format!("failed to load session config '{}'", path.display())
-                    })?;
-                    sessions.push(session);
+                    paths.push(path);
                 }
             }
         }
     }
+    // read_dir yields entries in an unspecified order; sort so both the loaded
+    // sessions and any skip warnings are reported deterministically.
+    paths.sort();
+    Ok(paths)
+}
+
+/// Distils an error chain into a single-line reason suitable for a warning.
+fn skip_reason(err: &anyhow::Error) -> String {
+    err.root_cause()
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("could not be parsed as a session config")
+        .trim()
+        .to_owned()
+}
+
+/// Load all supported session configs from a directory, failing on the first
+/// file that does not parse and validate as a [`Session`].
+///
+/// Only `.json`, `.toml`, `.yaml`, and `.yml` files are considered.
+/// The returned list is sorted by session name.
+///
+/// Use this for an explicitly requested directory (e.g. `list --config-dir`),
+/// where a malformed config is an error the caller wants surfaced. For a
+/// best-effort scan of a directory that may hold unrelated config files, use
+/// [`load_sessions_from_dir_lenient`].
+pub fn load_sessions_from_dir(dir: &Path) -> Result<Vec<Session>> {
+    let mut sessions = Vec::new();
+    for path in config_paths_in_dir(dir)? {
+        let session = load_session(&path)
+            .with_context(|| format!("failed to load session config '{}'", path.display()))?;
+        sessions.push(session);
+    }
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(sessions)
+}
+
+/// Like [`load_sessions_from_dir`], but instead of failing on the first config
+/// file that cannot be loaded as a session, it skips that file and records a
+/// concise reason in [`LenientDirScan::skipped`].
+///
+/// This is used for the implicit current-directory scan of `list`, where
+/// unrelated config-extension files (`Cargo.toml`, `package.json`,
+/// `tsconfig.json`, …) are expected to be present and must not abort the whole
+/// command. Reading the directory itself still errors (e.g. it does not exist).
+/// Sessions are sorted by name; skips are sorted by path.
+pub fn load_sessions_from_dir_lenient(dir: &Path) -> Result<LenientDirScan> {
+    let mut sessions = Vec::new();
+    let mut skipped = Vec::new();
+    for path in config_paths_in_dir(dir)? {
+        match load_session(&path) {
+            Ok(session) => sessions.push(session),
+            Err(err) => skipped.push(SkippedConfig {
+                path,
+                reason: skip_reason(&err),
+            }),
+        }
+    }
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(LenientDirScan { sessions, skipped })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -220,6 +290,60 @@ type = "pane"
         let dir = tempfile::tempdir().unwrap();
         let sessions = load_sessions_from_dir(dir.path()).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn load_sessions_from_dir_lenient_skips_non_session_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real session config…
+        std::fs::write(dir.path().join("dev.json"), json_content()).unwrap();
+        // …a Cargo.toml-style file (valid TOML, not a session)…
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        // …and a syntactically broken JSON file.
+        std::fs::write(dir.path().join("broken.json"), "{ not valid").unwrap();
+
+        let scan = load_sessions_from_dir_lenient(dir.path()).unwrap();
+
+        assert_eq!(scan.sessions.len(), 1, "only the real session should load");
+        assert_eq!(scan.sessions[0].name, "test-session");
+
+        let skipped: Vec<_> = scan
+            .skipped
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(skipped.contains(&"Cargo.toml".to_owned()), "{skipped:?}");
+        assert!(skipped.contains(&"broken.json".to_owned()), "{skipped:?}");
+        assert!(
+            scan.skipped.iter().all(|s| !s.reason.is_empty()),
+            "every skip must carry a non-empty single-line reason: {:?}",
+            scan.skipped
+        );
+        assert!(
+            scan.skipped.iter().all(|s| !s.reason.contains('\n')),
+            "skip reasons must be single-line for a clean warning: {:?}",
+            scan.skipped
+        );
+    }
+
+    #[test]
+    fn load_sessions_from_dir_lenient_reports_no_skips_when_all_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.json"), json_content()).unwrap();
+        std::fs::write(dir.path().join("b.yaml"), yaml_content()).unwrap();
+
+        let scan = load_sessions_from_dir_lenient(dir.path()).unwrap();
+        assert_eq!(scan.sessions.len(), 2);
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped);
+    }
+
+    #[test]
+    fn load_sessions_from_dir_lenient_still_errors_on_missing_directory() {
+        let result = load_sessions_from_dir_lenient(Path::new("/nonexistent/directory"));
+        assert!(
+            result.is_err(),
+            "reading a missing directory must still error"
+        );
     }
 
     #[test]

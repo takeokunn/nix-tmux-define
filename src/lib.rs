@@ -42,6 +42,7 @@ pub mod backend;
 pub mod compiler;
 pub mod executor;
 pub mod format;
+pub mod layout_plan;
 pub mod model;
 
 pub use backend::{RealTmux, RecordingBackend, TmuxBackend};
@@ -51,6 +52,7 @@ pub use format::{
     load_session, load_sessions_from_dir, load_sessions_from_dir_lenient, LenientDirScan,
     SkippedConfig,
 };
+pub use layout_plan::{LayoutPlan, PaneIndex, PlannedLeaf, PlannedSplit};
 pub use model::*;
 
 /// Maximum nesting depth for layout trees, enforced in both compiler and executor.

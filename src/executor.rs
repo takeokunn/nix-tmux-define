@@ -1,26 +1,10 @@
 use crate::backend::TmuxBackend;
+use crate::layout_plan::LayoutPlan;
 use crate::model::{resolve_tmux_arg_vars, resolve_vars};
 use crate::model::{
-    EnvVar, LayoutNode, PaneCommand, PaneId, PaneTitle, ResolvedTmuxArg, Session, ShellCommand,
-    TemplateVars, TmuxName, WaitFor, Window,
+    EnvVar, PaneId, Session, ShellCommand, TemplateVars, TmuxName, WaitFor, Window,
 };
 use anyhow::{Context, Error, Result};
-
-// ─── Internal record ─────────────────────────────────────────────────────────
-
-struct PaneRecord {
-    id: PaneId,
-    command: Option<PaneCommand>,
-    title: Option<PaneTitle>,
-    focus: bool,
-    wait_for: Option<WaitFor>,
-}
-
-struct WindowBuildContext<'a> {
-    root: &'a ResolvedTmuxArg,
-    vars: &'a TemplateVars,
-    env: &'a [EnvVar],
-}
 
 // ─── Executor ────────────────────────────────────────────────────────────────
 
@@ -172,6 +156,9 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
         let env = effective_window_env(session, window);
         let window_name = window.name.clone();
 
+        // Single source of truth for pane structure, shared with the compiler.
+        let plan = LayoutPlan::build(&window.layout, vars)?;
+
         let initial = if index == 0 {
             self.backend
                 .new_session_with_env(session_name, &root, &window_name, &env)?
@@ -187,29 +174,38 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
                 }
             }
 
-            // Phase 1: build pane structure
-            let mut records = Vec::new();
-            let ctx = WindowBuildContext {
-                root: &root,
-                vars,
-                env: &env,
-            };
-            self.collect_structure(&window.layout, &initial, &ctx, &mut records, 0)?;
+            // Phase 1: build pane structure. `pane_ids[i]` is the tmux pane for
+            // plan pane index `i`; splits are ordered so a parent always exists
+            // before it is split (parent < new, new increases by one each step).
+            let mut pane_ids: Vec<PaneId> = Vec::with_capacity(plan.pane_count());
+            pane_ids.push(initial.clone());
+            for split in plan.splits() {
+                debug_assert_eq!(split.new, pane_ids.len(), "plan pane indices must be dense");
+                let new_pane = self.backend.split_window_with_env(
+                    &pane_ids[split.parent],
+                    split.flag,
+                    split.pct,
+                    &root,
+                    &env,
+                )?;
+                pane_ids.push(new_pane);
+            }
 
             // Phase 2: send commands / titles / wait_for
             let mut focus_pane: Option<PaneId> = None;
-            for rec in &records {
-                if let Some(cmd) = &rec.command {
-                    self.backend.send_keys(&rec.id, cmd)?;
+            for leaf in plan.leaves() {
+                let pane = &pane_ids[leaf.pane];
+                if let Some(cmd) = &leaf.command {
+                    self.backend.send_keys(pane, cmd)?;
                 }
-                if let Some(wf) = &rec.wait_for {
-                    self.wait_for_pane_output(&rec.id, wf)?;
+                if let Some(wf) = &leaf.wait_for {
+                    self.wait_for_pane_output(pane, wf)?;
                 }
-                if let Some(title) = &rec.title {
-                    self.backend.set_pane_title(&rec.id, title)?;
+                if let Some(title) = &leaf.title {
+                    self.backend.set_pane_title(pane, title)?;
                 }
-                if rec.focus {
-                    focus_pane = Some(rec.id.clone());
+                if leaf.focus {
+                    focus_pane = Some(pane.clone());
                 }
             }
 
@@ -232,59 +228,6 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
             Err(err) if index == 0 => Err(self.rollback_session(session_name, err)),
             Err(err) => Err(err),
         }
-    }
-
-    fn collect_structure(
-        &self,
-        node: &LayoutNode,
-        current: &PaneId,
-        ctx: &WindowBuildContext<'_>,
-        records: &mut Vec<PaneRecord>,
-        depth: usize,
-    ) -> Result<()> {
-        if depth > crate::MAX_LAYOUT_DEPTH {
-            anyhow::bail!(
-                "layout tree is too deeply nested (max depth: {})",
-                crate::MAX_LAYOUT_DEPTH
-            );
-        }
-        match node {
-            LayoutNode::Pane {
-                command,
-                focus,
-                title,
-                wait_for,
-            } => {
-                records.push(PaneRecord {
-                    id: current.clone(),
-                    command: command
-                        .as_ref()
-                        .map(|c| PaneCommand::new(resolve_vars(c.as_str(), ctx.vars)))
-                        .transpose()?,
-                    title: title
-                        .as_ref()
-                        .map(|t| PaneTitle::new(resolve_vars(t.as_str(), ctx.vars)))
-                        .transpose()?,
-                    focus: *focus,
-                    wait_for: wait_for.clone(),
-                });
-            }
-            LayoutNode::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => {
-                let flag = direction.tmux_split_flag();
-                let pct = ratio.tmux_second_pane_percent();
-                let new_pane = self
-                    .backend
-                    .split_window_with_env(current, flag, pct, ctx.root, ctx.env)?;
-                self.collect_structure(first, current, ctx, records, depth + 1)?;
-                self.collect_structure(second, &new_pane, ctx, records, depth + 1)?;
-            }
-        }
-        Ok(())
     }
 
     fn wait_for_pane_output(&self, pane_id: &PaneId, wf: &WaitFor) -> Result<()> {
@@ -352,9 +295,9 @@ mod tests {
     use crate::backend::{RecordingBackend, TmuxBackend};
     use crate::model::{
         Direction, EnvVar, EnvVarName, EnvVarValue, LayoutNode, PaneCommand, PaneTitle,
-        RootTemplate, Session, ShellCommand, SplitRatio, TemplateVarName, TemplateVarValue,
-        TmuxLayoutPreset, TmuxName, TmuxOptionName, TmuxOptionValue, TmuxPanePercent,
-        TmuxSplitFlag, WaitFor, WaitPattern, WaitTimeoutSeconds, Window,
+        ResolvedTmuxArg, RootTemplate, Session, ShellCommand, SplitRatio, TemplateVarName,
+        TemplateVarValue, TmuxLayoutPreset, TmuxName, TmuxOptionName, TmuxOptionValue,
+        TmuxPanePercent, TmuxSplitFlag, WaitFor, WaitPattern, WaitTimeoutSeconds, Window,
     };
     use std::collections::BTreeMap;
 

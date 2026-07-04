@@ -1,28 +1,9 @@
+use crate::layout_plan::LayoutPlan;
 use crate::model::{
-    resolve_vars, shell_quote, shell_quote_template_vars, EnvVar, LayoutNode, PaneCommand,
-    PaneTitle, Session, ShellCommand, ShellWord, TemplateVars, WaitPattern, WaitTimeoutSeconds,
-    Window,
+    resolve_vars, shell_quote, shell_quote_template_vars, EnvVar, LayoutNode, Session,
+    ShellCommand, Window,
 };
 use anyhow::Result;
-
-// ─── Internal record ─────────────────────────────────────────────────────────
-
-/// Metadata collected for each leaf pane during the structure-building phase.
-struct PaneRecord {
-    var: String,
-    command: Option<PaneCommand>,
-    title: Option<PaneTitle>,
-    focus: bool,
-    has_wait_for: bool,
-    wait_pattern: Option<WaitPattern>,
-    wait_timeout: Option<WaitTimeoutSeconds>,
-}
-
-struct CompileWindowContext<'a> {
-    root: &'a ShellWord,
-    vars: &'a TemplateVars,
-    tmux_env: &'a str,
-}
 
 // ─── Compiler ─────────────────────────────────────────────────────────────────
 
@@ -68,12 +49,6 @@ impl Compiler {
 
     fn emit(&mut self, s: impl Into<String>) {
         self.lines.push(s.into());
-    }
-
-    fn alloc_pane(&mut self) -> String {
-        let name = format!("PANE_{}", self.pane_counter);
-        self.pane_counter += 1;
-        name
     }
 
     fn session_uses_wait_for(&self, session: &Session) -> bool {
@@ -165,12 +140,20 @@ impl Compiler {
         window_env.extend(window.env.clone());
         let tmux_env = tmux_env_args(&window_env);
 
+        // Single source of truth for pane structure, shared with the executor.
+        let plan = LayoutPlan::build(&window.layout, &session.vars)?;
+
+        // Plan pane index `i` renders to bash var `PANE_{base + i}`; the running
+        // `base` keeps pane var names unique across windows.
+        let base = self.pane_counter;
+        self.pane_counter = base + plan.pane_count();
+        let var = |i: usize| format!("PANE_{}", base + i);
+
         // ── Phase 1: build pane structure ────────────────────────────────────
-        let initial = if index == 0 {
-            let var = self.alloc_pane();
+        if index == 0 {
             self.emit(format!(
                 "{}=$(tmux new-session -d -s \"$SESSION\" -c {} -n {}{} -P -F '#{{pane_id}}')",
-                var,
+                var(0),
                 root.as_str(),
                 shell_quote(window.name.as_str()),
                 tmux_env,
@@ -183,61 +166,60 @@ impl Compiler {
                     shell_quote(v.as_str()),
                 ));
             }
-            var
         } else {
-            let var = self.alloc_pane();
             self.emit(format!(
                 "{}=$(tmux new-window -t \"$SESSION\" -c {} -n {}{} -P -F '#{{pane_id}}')",
-                var,
+                var(0),
                 root.as_str(),
                 shell_quote(window.name.as_str()),
                 tmux_env,
             ));
-            var
-        };
+        }
 
-        let mut records: Vec<PaneRecord> = Vec::new();
-        let ctx = CompileWindowContext {
-            root: &root,
-            vars: &session.vars,
-            tmux_env: &tmux_env,
-        };
-        self.collect_structure(&window.layout, &initial, &ctx, &mut records, 0)?;
+        for split in plan.splits() {
+            // -l specifies the size of the *new* (second) pane
+            self.emit(format!(
+                "{}=$(tmux split-window -t \"${{{}}}\" {} -l {} -c {}{} -P -F '#{{pane_id}}')",
+                var(split.new),
+                var(split.parent),
+                split.flag.as_str(),
+                split.pct.as_tmux_size(),
+                root.as_str(),
+                tmux_env,
+            ));
+        }
 
         // ── Phase 2: send commands and configure panes ───────────────────────
         let mut focus_var: Option<String> = None;
-        for rec in &records {
-            if let Some(cmd) = &rec.command {
+        for leaf in plan.leaves() {
+            if let Some(cmd) = &leaf.command {
                 self.emit(format!(
                     "tmux send-keys -t \"${{{}}}\" -l -- {}",
-                    rec.var,
+                    var(leaf.pane),
                     shell_quote(cmd.as_str()),
                 ));
-                self.emit(format!("tmux send-keys -t \"${{{}}}\" Enter", rec.var));
-            }
-            if rec.has_wait_for {
-                let pattern = rec
-                    .wait_pattern
-                    .as_ref()
-                    .map(WaitPattern::as_str)
-                    .unwrap_or("");
-                let timeout = rec.wait_timeout.unwrap_or_default();
                 self.emit(format!(
-                    "_ntd_wait_pane \"${{{}}}\" {} {}",
-                    rec.var,
-                    shell_quote(pattern),
-                    timeout.as_secs(),
+                    "tmux send-keys -t \"${{{}}}\" Enter",
+                    var(leaf.pane)
                 ));
             }
-            if let Some(title) = &rec.title {
+            if let Some(wf) = &leaf.wait_for {
+                self.emit(format!(
+                    "_ntd_wait_pane \"${{{}}}\" {} {}",
+                    var(leaf.pane),
+                    shell_quote(wf.pattern.as_str()),
+                    wf.timeout.as_secs(),
+                ));
+            }
+            if let Some(title) = &leaf.title {
                 self.emit(format!(
                     "tmux select-pane -t \"${{{}}}\" -T {}",
-                    rec.var,
+                    var(leaf.pane),
                     shell_quote(title.as_str()),
                 ));
             }
-            if rec.focus {
-                focus_var = Some(rec.var.clone());
+            if leaf.focus {
+                focus_var = Some(var(leaf.pane));
             }
         }
 
@@ -272,71 +254,6 @@ impl Compiler {
         }
 
         self.emit("");
-        Ok(())
-    }
-
-    /// Recursively emits `split-window` commands (phase 1) and appends a
-    /// [`PaneRecord`] for every leaf pane encountered.
-    fn collect_structure(
-        &mut self,
-        node: &LayoutNode,
-        current: &str,
-        ctx: &CompileWindowContext<'_>,
-        records: &mut Vec<PaneRecord>,
-        depth: usize,
-    ) -> Result<()> {
-        if depth > crate::MAX_LAYOUT_DEPTH {
-            anyhow::bail!(
-                "layout tree is too deeply nested (max depth: {})",
-                crate::MAX_LAYOUT_DEPTH
-            );
-        }
-        match node {
-            LayoutNode::Pane {
-                command,
-                focus,
-                title,
-                wait_for,
-            } => {
-                records.push(PaneRecord {
-                    var: current.to_string(),
-                    command: command
-                        .as_ref()
-                        .map(|c| PaneCommand::new(resolve_vars(c.as_str(), ctx.vars)))
-                        .transpose()?,
-                    title: title
-                        .as_ref()
-                        .map(|t| PaneTitle::new(resolve_vars(t.as_str(), ctx.vars)))
-                        .transpose()?,
-                    focus: *focus,
-                    has_wait_for: wait_for.is_some(),
-                    wait_pattern: wait_for.as_ref().map(|wf| wf.pattern.clone()),
-                    wait_timeout: wait_for.as_ref().map(|wf| wf.timeout),
-                });
-            }
-            LayoutNode::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => {
-                let new_pane = self.alloc_pane();
-                let flag = direction.tmux_split_flag();
-                // -l specifies the size of the *new* (second) pane
-                let pct = ratio.tmux_second_pane_percent();
-                self.emit(format!(
-                    "{}=$(tmux split-window -t \"${{{}}}\" {} -l {} -c {}{} -P -F '#{{pane_id}}')",
-                    new_pane,
-                    current,
-                    flag.as_str(),
-                    pct.as_tmux_size(),
-                    ctx.root.as_str(),
-                    ctx.tmux_env,
-                ));
-                self.collect_structure(first, current, ctx, records, depth + 1)?;
-                self.collect_structure(second, &new_pane, ctx, records, depth + 1)?;
-            }
-        }
         Ok(())
     }
 }

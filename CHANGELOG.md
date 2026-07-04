@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clippy (`-D warnings`), rustfmt, nixfmt, actionlint, and example validation as
   flake checks, so local and CI results cannot diverge.
 - Dependabot keeps Cargo dependencies and GitHub Actions up to date.
+- Bumped `actions/checkout` to v7 and `cachix/cachix-action` to v17 in CI and
+  release workflows.
+- Release builds now enable LTO, a single codegen unit, and debuginfo
+  stripping (`[profile.release]` in `Cargo.toml`) for smaller, faster binaries.
+- **The compiler and executor now share one typed `LayoutPlan`.** The two paths
+  previously walked the layout tree with their own near-identical recursive
+  functions — the structural root cause of the fixed divergence bugs. Both now
+  build and render a single, backend-agnostic plan (splits + per-leaf config with
+  a whole `Option<WaitFor>` instead of loose "has_wait_for/pattern/timeout"
+  fields), so structural disagreement between `print` and `run` is no longer
+  representable. New property tests assert both paths render the plan identically
+  across hundreds of random sessions.
 
 ### Fixed
 - **`list` no longer aborts on unrelated config files in the current directory.**

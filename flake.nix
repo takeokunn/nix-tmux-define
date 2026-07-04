@@ -259,7 +259,18 @@
           };
 
           # ── Formatter (`nix fmt`) ─────────────────────────────────────────────
-          formatter = pkgs.nixfmt;
+          formatter = pkgs.writeShellApplication {
+            name = "fmt";
+            runtimeInputs = with pkgs; [
+              cargo
+              nixfmt
+              rustfmt
+            ];
+            text = ''
+              nixfmt "$@"
+              cargo fmt
+            '';
+          };
         };
 
       # ── Home Manager Module ───────────────────────────────────────────────────

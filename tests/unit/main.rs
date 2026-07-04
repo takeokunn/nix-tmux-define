@@ -4,5 +4,6 @@
 //! Example-based unit tests that exercise internals live in `src/` alongside the
 //! code; this tier holds the property-based tests, split by subject.
 
+mod differential;
 mod resolve_vars;
 mod shell_quote;

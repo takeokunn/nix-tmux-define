@@ -34,7 +34,7 @@ jobs:
             experimental-features = nix-command flakes
       # Only configure the binary cache when the auth token is available
       # (it is not exposed to pull requests from forks).
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         if: ${{ env.CACHIX_AUTH_TOKEN != '' }}
         with:
           name: takeokunn-nix-tmux-define

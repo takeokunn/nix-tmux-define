@@ -316,17 +316,29 @@ nix-tmux-define run --config <PATH>
 
 Options:
   --config <PATH>   Path to the session config (JSON, TOML, or YAML)
+  --no-attach       Build the session but do not attach or switch to it
 ```
+
+Attaching is **terminal-aware**: inside tmux it switches the current client, with
+a terminal on stdin it attaches, and with no terminal (a systemd oneshot, a CI
+step, any non-interactive caller) it builds the session detached and exits `0`
+instead of failing with `open terminal failed: not a terminal`. Pass
+`--no-attach` to stay detached even from a terminal — handy for preseeding
+sessions in the background.
 
 ### `reload`
 
 ```
 nix-tmux-define reload --config <PATH>
+
+Options:
+  --config <PATH>   Path to the session config (JSON, TOML, or YAML)
+  --no-attach       Reload the session but do not attach or switch to it
 ```
 
 Builds a replacement session, swaps it into the configured session name, then
 removes the old session. If replacement creation fails, the existing session is
-left in place.
+left in place. Attaching follows the same terminal-aware rules as `run`.
 
 ### `list`
 
@@ -379,13 +391,17 @@ The generated script is always idempotent:
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   if [ -n "${TMUX:-}" ]; then
     exec tmux switch-client -t "$SESSION"   # already inside tmux
-  else
+  elif [ -t 0 ]; then
     exec tmux attach-session -t "$SESSION"  # fresh terminal
+  else
+    echo "session '$SESSION' is ready (not attaching; no terminal)." >&2
+    exit 0                                  # headless: systemd, CI
   fi
 fi
 ```
 
-Running `tmux-session-dev` twice never creates a duplicate; it just reattaches.
+Running `tmux-session-dev` twice never creates a duplicate; it just reattaches —
+or, with no terminal, leaves the session ready and exits cleanly.
 
 ---
 

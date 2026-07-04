@@ -1,9 +1,11 @@
+use crate::attach::{resolve_attach_action, AttachAction, AttachMode};
 use crate::model::{
     EnvVar, PaneCommand, PaneId, PaneTitle, ResolvedTmuxArg, ShellCommand, TmuxLayoutPreset,
     TmuxName, TmuxOptionName, TmuxOptionValue, TmuxPanePercent, TmuxSplitFlag,
 };
 use anyhow::{Context, Result};
 use std::cell::{Cell, RefCell};
+use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
@@ -110,7 +112,19 @@ fn parse_capture_pane_output(stdout: &[u8], context: &str) -> Result<String> {
 // ─── RealTmux ─────────────────────────────────────────────────────────────────
 
 /// Calls the real `tmux` binary.
-pub struct RealTmux;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealTmux {
+    /// Whether — and when — to attach after building the session. See
+    /// [`AttachMode`]. Defaults to [`AttachMode::Auto`].
+    pub attach_mode: AttachMode,
+}
+
+impl RealTmux {
+    /// Construct a backend with the given attach policy.
+    pub fn new(attach_mode: AttachMode) -> Self {
+        Self { attach_mode }
+    }
+}
 
 impl TmuxBackend for RealTmux {
     fn has_session(&self, name: &TmuxName) -> bool {
@@ -373,14 +387,30 @@ impl TmuxBackend for RealTmux {
     }
 
     fn attach_or_switch(&self, session: &TmuxName) -> Result<()> {
-        let status = if std::env::var("TMUX").is_ok() {
-            std::process::Command::new("tmux")
+        let action = resolve_attach_action(
+            self.attach_mode,
+            std::env::var_os("TMUX").is_some(),
+            std::io::stdin().is_terminal(),
+        );
+        let status = match action {
+            AttachAction::Switch => Command::new("tmux")
                 .args(["switch-client", "-t", session.as_str()])
-                .status()?
-        } else {
-            std::process::Command::new("tmux")
+                .status()?,
+            AttachAction::Attach => Command::new("tmux")
                 .args(["attach-session", "-t", session.as_str()])
-                .status()?
+                .status()?,
+            AttachAction::Skip => {
+                // The session is built and detached; there is just no terminal
+                // to hand over (headless caller / --no-attach). Report where it
+                // went instead of failing the command.
+                eprintln!(
+                    "nix-tmux-define: session {:?} is ready (not attaching). \
+                     Attach later with: tmux attach -t {}",
+                    session.as_str(),
+                    session.as_str()
+                );
+                return Ok(());
+            }
         };
         anyhow::ensure!(
             status.success(),

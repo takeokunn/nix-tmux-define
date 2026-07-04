@@ -38,6 +38,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod attach;
 pub mod backend;
 pub mod compiler;
 pub mod executor;
@@ -45,6 +46,7 @@ pub mod format;
 pub mod layout_plan;
 pub mod model;
 
+pub use attach::{resolve_attach_action, AttachAction, AttachMode};
 pub use backend::{RealTmux, RecordingBackend, TmuxBackend};
 pub use compiler::Compiler;
 pub use executor::Executor;

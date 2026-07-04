@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use nix_tmux_define::{
-    load_session, load_sessions_from_dir, load_sessions_from_dir_lenient, Compiler, Executor,
-    RealTmux, Session, TmuxName,
+    load_session, load_sessions_from_dir, load_sessions_from_dir_lenient, AttachMode, Compiler,
+    Executor, RealTmux, Session, TmuxName,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,11 @@ enum Command {
         /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
+        /// Build the session but do not attach or switch to it, even from a
+        /// terminal. Without this flag, attaching is skipped automatically when
+        /// no terminal is available (e.g. a systemd service).
+        #[arg(long)]
+        no_attach: bool,
     },
 
     /// Print the generated bash script to stdout without executing
@@ -46,6 +51,11 @@ enum Command {
         /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
+        /// Rebuild the session but do not attach or switch to it, even from a
+        /// terminal. Without this flag, attaching is skipped automatically when
+        /// no terminal is available (e.g. a systemd service).
+        #[arg(long)]
+        no_attach: bool,
     },
 
     /// List sessions from config files without probing tmux by default
@@ -73,6 +83,16 @@ fn generate(session: &Session) -> Result<String> {
     let mut compiler = Compiler::new();
     compiler.compile(session)?;
     Ok(compiler.into_script())
+}
+
+/// Map the `--no-attach` flag to an [`AttachMode`]. Without the flag the backend
+/// uses `Auto`, which attaches only when a terminal is available.
+fn attach_mode(no_attach: bool) -> AttachMode {
+    if no_attach {
+        AttachMode::Never
+    } else {
+        AttachMode::Auto
+    }
 }
 
 fn running_sessions_outcome(
@@ -144,9 +164,9 @@ fn print_session_list(sessions: &[Session], running: Option<&HashSet<TmuxName>>)
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config } => {
+        Command::Run { config, no_attach } => {
             let session = load_session(&config)?;
-            let backend = RealTmux;
+            let backend = RealTmux::new(attach_mode(no_attach));
             let executor = Executor::new(&backend);
             executor.run(&session)?;
         }
@@ -165,9 +185,9 @@ fn main() -> Result<()> {
             );
         }
 
-        Command::Reload { config } => {
+        Command::Reload { config, no_attach } => {
             let session = load_session(&config)?;
-            let backend = RealTmux;
+            let backend = RealTmux::new(attach_mode(no_attach));
             let executor = Executor::new(&backend);
             executor.reload(&session)?;
         }

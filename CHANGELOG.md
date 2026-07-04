@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-04
+
 ### Added
 - **`run` / `reload` are now safe to invoke without a terminal** (e.g. from a
   systemd oneshot or CI). Attaching is only attempted when a terminal is

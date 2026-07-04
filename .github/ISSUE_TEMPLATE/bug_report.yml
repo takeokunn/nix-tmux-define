@@ -1,0 +1,60 @@
+name: Bug report
+description: Report something that is not working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please fill in as much
+        of the following as you can — a minimal config that reproduces the issue
+        is the single most helpful thing you can provide.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I run `nix-tmux-define run --config ...`, the second pane ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal config to reproduce
+      description: The smallest JSON/TOML/YAML session config that triggers the bug.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      description: The exact command you ran and any error output.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `nix-tmux-define --version` (or the commit/flake rev).
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - x86_64-linux
+        - aarch64-linux
+        - x86_64-darwin
+        - aarch64-darwin
+        - other
+    validations:
+      required: true
+  - type: input
+    id: tmux-version
+    attributes:
+      label: tmux version
+      description: Output of `tmux -V`.
+    validations:
+      required: false

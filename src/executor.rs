@@ -1,17 +1,25 @@
 use crate::backend::TmuxBackend;
-use crate::model::resolve_vars;
-use crate::model::{Direction, LayoutNode, Session, WaitFor, Window};
-use anyhow::Result;
-use std::collections::HashMap;
+use crate::model::{resolve_tmux_arg_vars, resolve_vars};
+use crate::model::{
+    EnvVar, LayoutNode, PaneCommand, PaneId, PaneTitle, ResolvedTmuxArg, Session, ShellCommand,
+    TemplateVars, TmuxName, WaitFor, Window,
+};
+use anyhow::{Context, Error, Result};
 
 // ─── Internal record ─────────────────────────────────────────────────────────
 
 struct PaneRecord {
-    id: String,
-    command: Option<String>,
-    title: Option<String>,
+    id: PaneId,
+    command: Option<PaneCommand>,
+    title: Option<PaneTitle>,
     focus: bool,
     wait_for: Option<WaitFor>,
+}
+
+struct WindowBuildContext<'a> {
+    root: &'a ResolvedTmuxArg,
+    vars: &'a TemplateVars,
+    env: &'a [EnvVar],
 }
 
 // ─── Executor ────────────────────────────────────────────────────────────────
@@ -26,106 +34,211 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
     }
 
     pub fn run(&self, session: &Session) -> Result<()> {
-        if self.backend.has_session(&session.name) {
-            return self.backend.attach_or_switch(&session.name);
+        session.validate()?;
+        let session_name = session.name.clone();
+        if self.backend.has_session(&session_name) {
+            return self.backend.attach_or_switch(&session_name);
         }
-        self.create_session(session)?;
+        self.create_session(session, &session_name)?;
         if let Some(first) = session.windows.first() {
-            self.backend.select_window(&session.name, &first.name)?;
+            self.backend.select_window(&session_name, &first.name)?;
         }
-        self.backend.attach_or_switch(&session.name)
+        self.backend.attach_or_switch(&session_name)
     }
 
     pub fn reload(&self, session: &Session) -> Result<()> {
-        let _ = self.backend.kill_session(&session.name);
-        self.create_session(session)?;
-        if let Some(first) = session.windows.first() {
-            self.backend.select_window(&session.name, &first.name)?;
+        session.validate()?;
+        let session_name = session.name.clone();
+        if self.backend.has_session(&session_name) {
+            self.replace_existing_session(session, &session_name)?;
+        } else {
+            self.create_session(session, &session_name)?;
         }
-        self.backend.attach_or_switch(&session.name)
+        if let Some(first) = session.windows.first() {
+            self.backend.select_window(&session_name, &first.name)?;
+        }
+        self.backend.attach_or_switch(&session_name)
     }
 
-    fn create_session(&self, session: &Session) -> Result<()> {
+    fn replace_existing_session(&self, session: &Session, session_name: &TmuxName) -> Result<()> {
+        let replacement_tmux_name =
+            reload_side_session_name(session_name, ReloadSideSession::Replacement)?;
+        let backup_tmux_name = reload_side_session_name(session_name, ReloadSideSession::Backup)?;
+        let mut replacement = session.clone();
+        replacement.name = replacement_tmux_name.clone();
+
+        self.create_session(&replacement, &replacement_tmux_name)
+            .with_context(|| {
+                format!(
+                    "failed to build replacement tmux session {:?}",
+                    replacement_tmux_name.as_str()
+                )
+            })?;
+
+        if let Err(err) = self.backend.rename_session(session_name, &backup_tmux_name) {
+            let _ = self.backend.kill_session(&replacement_tmux_name);
+            return Err(err.context(format!(
+                "failed to move existing tmux session {:?} aside",
+                session.name
+            )));
+        }
+
+        if let Err(err) = self
+            .backend
+            .rename_session(&replacement_tmux_name, session_name)
+        {
+            let restore_result = self.backend.rename_session(&backup_tmux_name, session_name);
+            let cleanup_result = self.backend.kill_session(&replacement_tmux_name);
+            let mut message = format!(
+                "failed to promote replacement tmux session {:?} to {:?}",
+                replacement_tmux_name.as_str(),
+                session.name.as_str()
+            );
+            if let Err(restore_err) = restore_result {
+                message.push_str(&format!(
+                    "; also failed to restore original session from {:?}: {restore_err}",
+                    backup_tmux_name.as_str()
+                ));
+            }
+            if let Err(cleanup_err) = cleanup_result {
+                message.push_str(&format!(
+                    "; also failed to remove replacement session {:?}: {cleanup_err}",
+                    replacement_tmux_name.as_str()
+                ));
+            }
+            return Err(err.context(message));
+        }
+
+        self.backend
+            .kill_session(&backup_tmux_name)
+            .with_context(|| {
+                format!(
+                    "replacement tmux session {:?} is active, but failed to remove backup session {:?}",
+                    session.name.as_str(),
+                    backup_tmux_name.as_str()
+                )
+            })?;
+        Ok(())
+    }
+
+    fn create_session(&self, session: &Session, session_name: &TmuxName) -> Result<()> {
         let vars = &session.vars;
         if let Some(hook) = &session.pre_hook {
-            self.backend.run_command(&resolve_vars(hook, vars))?;
+            let command = ShellCommand::new(resolve_vars(hook.as_str(), vars))?;
+            self.backend.run_command(&command)?;
         }
         for (idx, window) in session.windows.iter().enumerate() {
-            self.create_window(session, window, idx, vars)?;
+            if let Err(err) = self.create_window(session, session_name, window, idx, vars) {
+                if idx > 0 {
+                    return Err(self.rollback_session(session_name, err));
+                }
+                return Err(err);
+            }
         }
         Ok(())
+    }
+
+    fn rollback_session(&self, session_name: &TmuxName, cause: Error) -> Error {
+        let cause_msg = cause.to_string();
+        match self.backend.kill_session(session_name) {
+            Ok(()) => cause.context(format!(
+                "rolled back partially created tmux session {:?} after error: {cause_msg}",
+                session_name.as_str()
+            )),
+            Err(rollback_err) => cause.context(format!(
+                "failed to roll back partially created tmux session {:?} after error: {cause_msg}: {rollback_err}",
+                session_name.as_str()
+            )),
+        }
     }
 
     fn create_window(
         &self,
         session: &Session,
+        session_name: &TmuxName,
         window: &Window,
         index: usize,
-        vars: &HashMap<String, String>,
+        vars: &TemplateVars,
     ) -> Result<()> {
-        let root = resolve_vars(
+        let root = resolve_tmux_arg_vars(
             window
                 .root
-                .as_deref()
-                .or(session.root.as_deref())
-                .unwrap_or("$HOME"),
+                .as_ref()
+                .map(|root| root.as_str())
+                .or_else(|| session.root.as_ref().map(|root| root.as_str()))
+                .unwrap_or("~"),
             vars,
-        );
+        )?;
+        let env = effective_window_env(session, window);
+        let window_name = window.name.clone();
 
         let initial = if index == 0 {
-            let p = self
-                .backend
-                .new_session(&session.name, &root, &window.name)?;
-            for (k, v) in &session.options {
-                self.backend.set_option(&session.name, k, v)?;
-            }
-            p
+            self.backend
+                .new_session_with_env(session_name, &root, &window_name, &env)?
         } else {
             self.backend
-                .new_window(&session.name, &window.name, &root)?
+                .new_window_with_env(session_name, &window_name, &root, &env)?
         };
 
-        // Phase 1: build pane structure
-        let mut records = Vec::new();
-        self.collect_structure(&window.layout, &initial, &root, vars, &mut records, 0)?;
+        let configure_result = (|| -> Result<()> {
+            if index == 0 {
+                for (k, v) in &session.options {
+                    self.backend.set_option(session_name, k, v)?;
+                }
+            }
 
-        // Phase 2: send commands / titles / wait_for
-        let mut focus_pane: Option<String> = None;
-        for rec in &records {
-            if let Some(cmd) = &rec.command {
-                self.backend.send_keys(&rec.id, cmd)?;
-            }
-            if let Some(wf) = &rec.wait_for {
-                self.wait_for_pane_output(&rec.id, wf)?;
-            }
-            if let Some(title) = &rec.title {
-                self.backend.set_pane_title(&rec.id, title)?;
-            }
-            if rec.focus {
-                focus_pane = Some(rec.id.clone());
-            }
-        }
+            // Phase 1: build pane structure
+            let mut records = Vec::new();
+            let ctx = WindowBuildContext {
+                root: &root,
+                vars,
+                env: &env,
+            };
+            self.collect_structure(&window.layout, &initial, &ctx, &mut records, 0)?;
 
-        for (k, v) in &window.options {
-            self.backend
-                .set_window_option(&session.name, &window.name, k, v)?;
+            // Phase 2: send commands / titles / wait_for
+            let mut focus_pane: Option<PaneId> = None;
+            for rec in &records {
+                if let Some(cmd) = &rec.command {
+                    self.backend.send_keys(&rec.id, cmd)?;
+                }
+                if let Some(wf) = &rec.wait_for {
+                    self.wait_for_pane_output(&rec.id, wf)?;
+                }
+                if let Some(title) = &rec.title {
+                    self.backend.set_pane_title(&rec.id, title)?;
+                }
+                if rec.focus {
+                    focus_pane = Some(rec.id.clone());
+                }
+            }
+
+            for (k, v) in &window.options {
+                self.backend
+                    .set_window_option(session_name, &window_name, k, v)?;
+            }
+            if let Some(preset) = &window.select_layout {
+                self.backend
+                    .select_layout(session_name, &window_name, preset)?;
+            }
+            if let Some(fp) = focus_pane {
+                self.backend.select_pane(&fp)?;
+            }
+            Ok(())
+        })();
+
+        match configure_result {
+            Ok(()) => Ok(()),
+            Err(err) if index == 0 => Err(self.rollback_session(session_name, err)),
+            Err(err) => Err(err),
         }
-        if let Some(preset) = &window.select_layout {
-            self.backend
-                .select_layout(&session.name, &window.name, preset)?;
-        }
-        if let Some(fp) = focus_pane {
-            self.backend.select_pane(&fp)?;
-        }
-        Ok(())
     }
 
     fn collect_structure(
         &self,
         node: &LayoutNode,
-        current: &str,
-        root: &str,
-        vars: &HashMap<String, String>,
+        current: &PaneId,
+        ctx: &WindowBuildContext<'_>,
         records: &mut Vec<PaneRecord>,
         depth: usize,
     ) -> Result<()> {
@@ -143,9 +256,15 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
                 wait_for,
             } => {
                 records.push(PaneRecord {
-                    id: current.to_string(),
-                    command: command.as_ref().map(|c| resolve_vars(c, vars)),
-                    title: title.as_ref().map(|t| resolve_vars(t, vars)),
+                    id: current.clone(),
+                    command: command
+                        .as_ref()
+                        .map(|c| PaneCommand::new(resolve_vars(c.as_str(), ctx.vars)))
+                        .transpose()?,
+                    title: title
+                        .as_ref()
+                        .map(|t| PaneTitle::new(resolve_vars(t.as_str(), ctx.vars)))
+                        .transpose()?,
                     focus: *focus,
                     wait_for: wait_for.clone(),
                 });
@@ -156,36 +275,73 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
                 first,
                 second,
             } => {
-                let flag = match direction {
-                    Direction::Horizontal => "-h",
-                    Direction::Vertical => "-v",
-                };
-                let pct = ((1.0 - ratio).clamp(0.0, 1.0) * 100.0).round() as u32;
-                let new_pane = self.backend.split_window(current, flag, pct, root)?;
-                self.collect_structure(first, current, root, vars, records, depth + 1)?;
-                self.collect_structure(second, &new_pane, root, vars, records, depth + 1)?;
+                let flag = direction.tmux_split_flag();
+                let pct = ratio.tmux_second_pane_percent();
+                let new_pane = self
+                    .backend
+                    .split_window_with_env(current, flag, pct, ctx.root, ctx.env)?;
+                self.collect_structure(first, current, ctx, records, depth + 1)?;
+                self.collect_structure(second, &new_pane, ctx, records, depth + 1)?;
             }
         }
         Ok(())
     }
 
-    fn wait_for_pane_output(&self, pane_id: &str, wf: &WaitFor) -> Result<()> {
-        for elapsed in 0..wf.timeout {
+    fn wait_for_pane_output(&self, pane_id: &PaneId, wf: &WaitFor) -> Result<()> {
+        // Matches the bash helper: check, sleep 1s, repeat up to timeout times.
+        // Each iteration is "check then wait", so timeout=N allows N full seconds.
+        let timeout = wf.timeout.as_secs();
+        for _ in 0..timeout {
             let out = self.backend.capture_pane(pane_id)?;
-            if out.contains(&wf.pattern) {
+            if out.contains(wf.pattern.as_str()) {
                 return Ok(());
             }
-            if elapsed + 1 < wf.timeout {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
         anyhow::bail!(
             "timeout after {}s: {:?} not seen in pane {}",
-            wf.timeout,
-            wf.pattern,
-            pane_id
+            timeout,
+            wf.pattern.as_str(),
+            pane_id.as_str()
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadSideSession {
+    Replacement,
+    Backup,
+}
+
+impl ReloadSideSession {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Replacement => "new",
+            Self::Backup => "old",
+        }
+    }
+}
+
+fn reload_side_session_name(session_name: &TmuxName, side: ReloadSideSession) -> Result<TmuxName> {
+    TmuxName::new(format!(
+        "{}__ntd_reload_{}_{}",
+        session_name.as_str(),
+        side.suffix(),
+        std::process::id()
+    ))
+    .with_context(|| {
+        format!(
+            "failed to derive {:?} reload tmux session name from {:?}",
+            side,
+            session_name.as_str()
+        )
+    })
+}
+
+fn effective_window_env(session: &Session, window: &Window) -> Vec<EnvVar> {
+    let mut env = session.env.clone();
+    env.extend(window.env.clone());
+    env
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -193,22 +349,101 @@ impl<'a, B: TmuxBackend> Executor<'a, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::RecordingBackend;
-    use crate::model::{EnvVar, LayoutNode, Session, WaitFor, Window};
-    use std::collections::HashMap;
+    use crate::backend::{RecordingBackend, TmuxBackend};
+    use crate::model::{
+        Direction, EnvVar, EnvVarName, EnvVarValue, LayoutNode, PaneCommand, PaneTitle,
+        RootTemplate, Session, ShellCommand, SplitRatio, TemplateVarName, TemplateVarValue,
+        TmuxLayoutPreset, TmuxName, TmuxOptionName, TmuxOptionValue, TmuxPanePercent,
+        TmuxSplitFlag, WaitFor, WaitPattern, WaitTimeoutSeconds, Window,
+    };
+    use std::collections::BTreeMap;
+
+    fn ratio(value: f64) -> SplitRatio {
+        SplitRatio::new(value).unwrap()
+    }
+
+    fn pc(value: &str) -> PaneCommand {
+        PaneCommand::new(value).unwrap()
+    }
+
+    fn pt(value: &str) -> PaneTitle {
+        PaneTitle::new(value).unwrap()
+    }
+
+    fn wp(value: &str) -> WaitPattern {
+        WaitPattern::new(value).unwrap()
+    }
+
+    fn tmux_name(value: &str) -> TmuxName {
+        TmuxName::new(value).unwrap()
+    }
+
+    fn root_template(value: &str) -> RootTemplate {
+        RootTemplate::new(value).unwrap()
+    }
+
+    fn shell_command(value: &str) -> ShellCommand {
+        ShellCommand::new(value).unwrap()
+    }
+
+    fn env_key(value: &str) -> EnvVarName {
+        EnvVarName::new(value).unwrap()
+    }
+
+    fn env_value(value: &str) -> EnvVarValue {
+        EnvVarValue::new(value).unwrap()
+    }
+
+    fn option_name(value: &str) -> TmuxOptionName {
+        TmuxOptionName::new(value).unwrap()
+    }
+
+    fn option_value(value: &str) -> TmuxOptionValue {
+        TmuxOptionValue::new(value).unwrap()
+    }
+
+    fn layout_preset(value: &str) -> TmuxLayoutPreset {
+        TmuxLayoutPreset::new(value).unwrap()
+    }
+
+    fn var_key(value: &str) -> TemplateVarName {
+        TemplateVarName::new(value).unwrap()
+    }
+
+    fn var_value(value: &str) -> TemplateVarValue {
+        TemplateVarValue::new(value).unwrap()
+    }
+
+    #[test]
+    fn reload_side_session_name_returns_typed_replacement_name() {
+        let name = reload_side_session_name(&tmux_name("demo"), ReloadSideSession::Replacement)
+            .unwrap()
+            .into_inner();
+
+        assert!(name.starts_with("demo__ntd_reload_new_"), "{name}");
+    }
+
+    #[test]
+    fn reload_side_session_name_returns_typed_backup_name() {
+        let name = reload_side_session_name(&tmux_name("demo"), ReloadSideSession::Backup)
+            .unwrap()
+            .into_inner();
+
+        assert!(name.starts_with("demo__ntd_reload_old_"), "{name}");
+    }
 
     fn simple_session(name: &str, cmd: Option<&str>) -> Session {
         Session {
-            name: name.into(),
-            root: Some("/tmp".into()),
+            name: tmux_name(name),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "main".into(),
+                name: tmux_name("main"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
-                    command: cmd.map(|s| s.into()),
+                    command: cmd.map(pc),
                     focus: false,
                     title: None,
                     wait_for: None,
@@ -216,8 +451,165 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        }
+    }
+
+    fn call_pos(calls: &[String], expected: &str) -> usize {
+        calls
+            .iter()
+            .position(|call| call == expected)
+            .unwrap_or_else(|| panic!("missing call {expected:?}: {calls:#?}"))
+    }
+
+    #[derive(Default)]
+    struct FailingBackend {
+        inner: RecordingBackend,
+        fail_set_option: bool,
+        fail_new_window: bool,
+    }
+
+    impl FailingBackend {
+        fn calls(&self) -> Vec<String> {
+            self.inner.calls()
+        }
+    }
+
+    impl TmuxBackend for FailingBackend {
+        fn has_session(&self, name: &TmuxName) -> bool {
+            self.inner.has_session(name)
+        }
+
+        fn new_session(
+            &self,
+            name: &TmuxName,
+            root: &ResolvedTmuxArg,
+            window_name: &TmuxName,
+        ) -> Result<PaneId> {
+            self.inner.new_session(name, root, window_name)
+        }
+
+        fn new_session_with_env(
+            &self,
+            name: &TmuxName,
+            root: &ResolvedTmuxArg,
+            window_name: &TmuxName,
+            env: &[EnvVar],
+        ) -> Result<PaneId> {
+            self.inner
+                .new_session_with_env(name, root, window_name, env)
+        }
+
+        fn split_window(
+            &self,
+            pane_id: &PaneId,
+            flag: TmuxSplitFlag,
+            pct: TmuxPanePercent,
+            root: &ResolvedTmuxArg,
+        ) -> Result<PaneId> {
+            self.inner.split_window(pane_id, flag, pct, root)
+        }
+
+        fn split_window_with_env(
+            &self,
+            pane_id: &PaneId,
+            flag: TmuxSplitFlag,
+            pct: TmuxPanePercent,
+            root: &ResolvedTmuxArg,
+            env: &[EnvVar],
+        ) -> Result<PaneId> {
+            self.inner
+                .split_window_with_env(pane_id, flag, pct, root, env)
+        }
+
+        fn new_window(
+            &self,
+            session: &TmuxName,
+            name: &TmuxName,
+            root: &ResolvedTmuxArg,
+        ) -> Result<PaneId> {
+            self.inner.new_window(session, name, root)
+        }
+
+        fn new_window_with_env(
+            &self,
+            session: &TmuxName,
+            name: &TmuxName,
+            root: &ResolvedTmuxArg,
+            env: &[EnvVar],
+        ) -> Result<PaneId> {
+            if self.fail_new_window {
+                anyhow::bail!("new-window failed");
+            }
+            self.inner.new_window_with_env(session, name, root, env)
+        }
+
+        fn send_keys(&self, pane_id: &PaneId, keys: &PaneCommand) -> Result<()> {
+            self.inner.send_keys(pane_id, keys)
+        }
+
+        fn select_pane(&self, pane_id: &PaneId) -> Result<()> {
+            self.inner.select_pane(pane_id)
+        }
+
+        fn set_pane_title(&self, pane_id: &PaneId, title: &PaneTitle) -> Result<()> {
+            self.inner.set_pane_title(pane_id, title)
+        }
+
+        fn set_option(
+            &self,
+            session: &TmuxName,
+            key: &TmuxOptionName,
+            value: &TmuxOptionValue,
+        ) -> Result<()> {
+            if self.fail_set_option {
+                anyhow::bail!("set-option failed");
+            }
+            self.inner.set_option(session, key, value)
+        }
+
+        fn set_window_option(
+            &self,
+            session: &TmuxName,
+            window: &TmuxName,
+            key: &TmuxOptionName,
+            value: &TmuxOptionValue,
+        ) -> Result<()> {
+            self.inner.set_window_option(session, window, key, value)
+        }
+
+        fn select_layout(
+            &self,
+            session: &TmuxName,
+            window: &TmuxName,
+            preset: &TmuxLayoutPreset,
+        ) -> Result<()> {
+            self.inner.select_layout(session, window, preset)
+        }
+
+        fn select_window(&self, session: &TmuxName, window: &TmuxName) -> Result<()> {
+            self.inner.select_window(session, window)
+        }
+
+        fn attach_or_switch(&self, session: &TmuxName) -> Result<()> {
+            self.inner.attach_or_switch(session)
+        }
+
+        fn kill_session(&self, name: &TmuxName) -> Result<()> {
+            self.inner.kill_session(name)
+        }
+
+        fn rename_session(&self, old: &TmuxName, new: &TmuxName) -> Result<()> {
+            self.inner.rename_session(old, new)
+        }
+
+        fn capture_pane(&self, pane_id: &PaneId) -> Result<String> {
+            self.inner.capture_pane(pane_id)
+        }
+
+        fn run_command(&self, cmd: &ShellCommand) -> Result<()> {
+            self.inner.run_command(cmd)
         }
     }
 
@@ -242,25 +634,25 @@ mod tests {
     fn executor_horizontal_split_order() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Split {
                     direction: Direction::Horizontal,
-                    ratio: 0.5,
+                    ratio: ratio(0.5),
                     first: Box::new(LayoutNode::Pane {
-                        command: Some("top".into()),
+                        command: Some(pc("top")),
                         focus: false,
                         title: None,
                         wait_for: None,
                     }),
                     second: Box::new(LayoutNode::Pane {
-                        command: Some("htop".into()),
+                        command: Some(pc("htop")),
                         focus: false,
                         title: None,
                         wait_for: None,
@@ -269,8 +661,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -294,17 +686,17 @@ mod tests {
     fn executor_focus_pane_selected() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Split {
                     direction: Direction::Horizontal,
-                    ratio: 0.5,
+                    ratio: ratio(0.5),
                     first: Box::new(LayoutNode::Pane {
                         command: None,
                         focus: true,
@@ -321,8 +713,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -352,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_reload_kills_then_creates() {
+    fn executor_reload_builds_replacement_before_moving_existing_session() {
         let b = RecordingBackend::new();
         b.session_exists.set(true);
         let session = simple_session("s", Some("vim"));
@@ -360,15 +752,64 @@ mod tests {
         ex.reload(&session).unwrap();
 
         let calls = b.calls();
-        let kill_pos = calls
-            .iter()
-            .position(|c| c.starts_with("kill-session:"))
-            .unwrap();
         let new_pos = calls
             .iter()
-            .position(|c| c.starts_with("new-session:"))
+            .position(|c| c.starts_with("new-session:s__ntd_reload_new_"))
             .unwrap();
-        assert!(kill_pos < new_pos, "kill-session must precede new-session");
+        let move_old_pos = calls
+            .iter()
+            .position(|c| c.starts_with("rename-session:s:s__ntd_reload_old_"))
+            .unwrap();
+        assert!(
+            new_pos < move_old_pos,
+            "replacement must be built before moving existing session"
+        );
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("rename-session:s__ntd_reload_new_") && c.ends_with(":s")));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("kill-session:s__ntd_reload_old_")));
+        assert!(!calls.iter().any(|c| c == "kill-session:s"));
+    }
+
+    #[test]
+    fn executor_reload_keeps_existing_session_when_replacement_creation_fails() {
+        let b = FailingBackend {
+            fail_set_option: true,
+            ..Default::default()
+        };
+        b.inner.session_exists.set(true);
+        let mut session = simple_session("s", None);
+        session
+            .options
+            .insert(option_name("status"), option_value("off"));
+        let ex = Executor::new(&b);
+        let err = ex.reload(&session).unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to build replacement"),
+            "{err}"
+        );
+        let calls = b.calls();
+        assert!(!calls.iter().any(|c| c == "kill-session:s"));
+        assert!(!calls.iter().any(|c| c.starts_with("rename-session:s:")));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("kill-session:s__ntd_reload_new_")));
+    }
+
+    #[test]
+    fn executor_reload_without_existing_session_creates_without_kill() {
+        let b = RecordingBackend::new();
+        let session = simple_session("s", Some("vim"));
+        let ex = Executor::new(&b);
+        ex.reload(&session).unwrap();
+
+        let calls = b.calls();
+        assert!(calls.iter().any(|c| c == "has-session:s"));
+        assert!(!calls.iter().any(|c| c == "kill-session:s"));
+        assert!(calls.iter().any(|c| c.starts_with("new-session:s:")));
     }
 
     #[test]
@@ -377,28 +818,28 @@ mod tests {
         *b.capture_output.borrow_mut() = "Server ready on port 3000".to_string();
 
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
-                    command: Some("npm start".into()),
+                    command: Some(pc("npm start")),
                     focus: false,
                     title: None,
                     wait_for: Some(WaitFor {
-                        pattern: "ready".into(),
-                        timeout: 5,
+                        pattern: wp("ready"),
+                        timeout: WaitTimeoutSeconds::new(5).unwrap(),
                     }),
                 },
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         // Should succeed because capture_output contains "ready"
@@ -411,28 +852,28 @@ mod tests {
         *b.capture_output.borrow_mut() = "still starting...".to_string();
 
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
-                    command: Some("npm start".into()),
+                    command: Some(pc("npm start")),
                     focus: false,
                     title: None,
                     wait_for: Some(WaitFor {
-                        pattern: "ready".into(),
-                        timeout: 1,
+                        pattern: wp("ready"),
+                        timeout: WaitTimeoutSeconds::new(1).unwrap(),
                     }),
                 },
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         let result = ex.run(&session);
@@ -444,16 +885,16 @@ mod tests {
     #[test]
     fn executor_session_options() {
         let b = RecordingBackend::new();
-        let mut opts = HashMap::new();
-        opts.insert("status".to_string(), "off".to_string());
+        let mut opts = BTreeMap::new();
+        opts.insert(option_name("status"), option_value("off"));
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
@@ -465,7 +906,7 @@ mod tests {
             env: vec![],
             pre_hook: None,
             options: opts,
-            vars: HashMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -478,15 +919,56 @@ mod tests {
     }
 
     #[test]
+    fn executor_applies_session_options_in_key_order() {
+        let b = RecordingBackend::new();
+        let mut opts = BTreeMap::new();
+        opts.insert(option_name("status-right"), option_value("right"));
+        opts.insert(option_name("base-index"), option_value("1"));
+        opts.insert(option_name("status-left"), option_value("left"));
+        let session = Session {
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
+            windows: vec![Window {
+                name: tmux_name("w"),
+                root: None,
+                env: vec![],
+                options: BTreeMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: opts,
+            vars: BTreeMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        let base = call_pos(&calls, "set-option:s:base-index:1");
+        let left = call_pos(&calls, "set-option:s:status-left:left");
+        let right = call_pos(&calls, "set-option:s:status-right:right");
+        assert!(
+            base < left && left < right,
+            "session options should follow key order: {calls:#?}"
+        );
+    }
+
+    #[test]
     fn executor_window_options() {
         let b = RecordingBackend::new();
-        let mut wopts = HashMap::new();
-        wopts.insert("synchronize-panes".to_string(), "on".to_string());
+        let mut wopts = BTreeMap::new();
+        wopts.insert(option_name("synchronize-panes"), option_value("on"));
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
                 options: wopts,
@@ -500,8 +982,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -516,17 +998,20 @@ mod tests {
     }
 
     #[test]
-    fn executor_select_layout() {
+    fn executor_applies_window_options_in_key_order() {
         let b = RecordingBackend::new();
+        let mut wopts = BTreeMap::new();
+        wopts.insert(option_name("synchronize-panes"), option_value("on"));
+        wopts.insert(option_name("automatic-rename"), option_value("off"));
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
-                select_layout: Some("tiled".into()),
+                options: wopts,
+                select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
                     focus: false,
@@ -536,8 +1021,44 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        let automatic = call_pos(&calls, "set-window-option:s:w:automatic-rename:off");
+        let synchronize = call_pos(&calls, "set-window-option:s:w:synchronize-panes:on");
+        assert!(
+            automatic < synchronize,
+            "window options should follow key order: {calls:#?}"
+        );
+    }
+
+    #[test]
+    fn executor_select_layout() {
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
+            windows: vec![Window {
+                name: tmux_name("w"),
+                root: None,
+                env: vec![],
+                options: BTreeMap::new(),
+                select_layout: Some(layout_preset("tiled")),
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            }],
+            env: vec![],
+            pre_hook: None,
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -553,25 +1074,25 @@ mod tests {
     fn executor_pane_title() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
                     focus: false,
-                    title: Some("my-title".into()),
+                    title: Some(pt("my-title")),
                     wait_for: None,
                 },
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -586,19 +1107,19 @@ mod tests {
     #[test]
     fn executor_template_vars() {
         let b = RecordingBackend::new();
-        let mut vars = HashMap::new();
-        vars.insert("mydir".to_string(), "/home/user/project".to_string());
+        let mut vars = BTreeMap::new();
+        vars.insert(var_key("mydir"), var_value("/home/user/project"));
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
-                    command: Some("cd {{mydir}}".into()),
+                    command: Some(pc("cd {{mydir}}")),
                     focus: false,
                     title: None,
                     wait_for: None,
@@ -606,7 +1127,7 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
+            options: BTreeMap::new(),
             vars,
         };
         let ex = Executor::new(&b);
@@ -625,16 +1146,16 @@ mod tests {
     fn executor_cwd_template() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
-                    command: Some("cd {{cwd}}".into()),
+                    command: Some(pc("cd {{cwd}}")),
                     focus: false,
                     title: None,
                     wait_for: None,
@@ -642,8 +1163,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -656,17 +1177,42 @@ mod tests {
     }
 
     #[test]
+    fn executor_resolves_builtin_cwd_root_to_concrete_path() {
+        let b = RecordingBackend::new();
+        let mut session = simple_session("cwd-root", None);
+        session.root = Some(root_template("{{cwd}}/project"));
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .expect("test cwd must be UTF-8");
+        let expected = format!("new-session:cwd-root:{cwd}/project:main:%0");
+        let calls = b.calls();
+        assert!(
+            calls.iter().any(|call| call == &expected),
+            "root builtin should resolve before tmux argv boundary: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.contains("$PWD")),
+            "tmux argv root must not receive shell syntax: {calls:?}"
+        );
+    }
+
+    #[test]
     fn executor_multiple_windows_uses_new_window() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![
                 Window {
-                    name: "first".into(),
+                    name: tmux_name("first"),
                     root: None,
                     env: vec![],
-                    options: HashMap::new(),
+                    options: BTreeMap::new(),
                     select_layout: None,
                     layout: LayoutNode::Pane {
                         command: None,
@@ -676,13 +1222,13 @@ mod tests {
                     },
                 },
                 Window {
-                    name: "second".into(),
+                    name: tmux_name("second"),
                     root: None,
                     env: vec![],
-                    options: HashMap::new(),
+                    options: BTreeMap::new(),
                     select_layout: None,
                     layout: LayoutNode::Pane {
-                        command: Some("bash".into()),
+                        command: Some(pc("bash")),
                         focus: false,
                         title: None,
                         wait_for: None,
@@ -691,8 +1237,8 @@ mod tests {
             ],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -706,25 +1252,25 @@ mod tests {
     fn executor_vertical_split() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Split {
                     direction: Direction::Vertical,
-                    ratio: 0.5,
+                    ratio: ratio(0.5),
                     first: Box::new(LayoutNode::Pane {
-                        command: Some("top".into()),
+                        command: Some(pc("top")),
                         focus: false,
                         title: None,
                         wait_for: None,
                     }),
                     second: Box::new(LayoutNode::Pane {
-                        command: Some("htop".into()),
+                        command: Some(pc("htop")),
                         focus: false,
                         title: None,
                         wait_for: None,
@@ -733,8 +1279,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -750,13 +1296,13 @@ mod tests {
     fn executor_pre_hook_runs_before_session() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
@@ -766,9 +1312,9 @@ mod tests {
                 },
             }],
             env: vec![],
-            pre_hook: Some("nix build".into()),
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            pre_hook: Some(shell_command("nix build")),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -786,16 +1332,116 @@ mod tests {
     }
 
     #[test]
+    fn executor_exports_session_and_window_env() {
+        // Regression: previously the executor ignored session.env / window.env
+        // entirely, so `run`/`reload` produced sessions WITHOUT the configured
+        // environment — diverging from the `print`/compiler path.
+        let b = RecordingBackend::new();
+        let session = Session {
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
+            windows: vec![Window {
+                name: tmux_name("w"),
+                root: None,
+                env: vec![EnvVar {
+                    key: env_key("WINDOW_VAR"),
+                    value: env_value("wval"),
+                }],
+                options: BTreeMap::new(),
+                select_layout: None,
+                layout: LayoutNode::command("echo hi").unwrap(),
+            }],
+            env: vec![EnvVar {
+                key: env_key("SESSION_VAR"),
+                value: env_value("sval"),
+            }],
+            pre_hook: None,
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        };
+        let ex = Executor::new(&b);
+        ex.run(&session).unwrap();
+
+        let calls = b.calls();
+        let new_session = calls
+            .iter()
+            .find(|c| c.starts_with("new-session:"))
+            .cloned()
+            .unwrap();
+        assert!(
+            new_session.contains(":env:SESSION_VAR=sval,WINDOW_VAR=wval"),
+            "session and window env must be scoped to tmux pane creation: {new_session}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set-env:")),
+            "executor must not mutate ambient process env: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn executor_rolls_back_initial_session_when_configuration_fails() {
+        let b = FailingBackend {
+            fail_set_option: true,
+            ..Default::default()
+        };
+        let mut session = simple_session("s", None);
+        session
+            .options
+            .insert(option_name("status"), option_value("off"));
+        let ex = Executor::new(&b);
+
+        let err = ex.run(&session).unwrap_err().to_string();
+        assert!(
+            err.contains("rolled back partially created tmux session"),
+            "error should report rollback: {err}"
+        );
+        assert!(
+            b.calls().iter().any(|c| c == "kill-session:s"),
+            "partial session must be killed: {:?}",
+            b.calls()
+        );
+    }
+
+    #[test]
+    fn executor_rolls_back_session_when_later_window_creation_fails() {
+        let b = FailingBackend {
+            fail_new_window: true,
+            ..Default::default()
+        };
+        let mut session = simple_session("s", None);
+        session.windows.push(Window {
+            name: tmux_name("second"),
+            root: None,
+            env: vec![],
+            options: BTreeMap::new(),
+            select_layout: None,
+            layout: LayoutNode::command("echo second").unwrap(),
+        });
+        let ex = Executor::new(&b);
+
+        let err = ex.run(&session).unwrap_err().to_string();
+        assert!(
+            err.contains("rolled back partially created tmux session"),
+            "error should report rollback: {err}"
+        );
+        assert!(
+            b.calls().iter().any(|c| c == "kill-session:s"),
+            "partial session must be killed: {:?}",
+            b.calls()
+        );
+    }
+
+    #[test]
     fn executor_window_root_overrides_session_root() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/session-root".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/session-root")),
             windows: vec![Window {
-                name: "w".into(),
-                root: Some("/window-root".into()),
+                name: tmux_name("w"),
+                root: Some(root_template("/window-root")),
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
@@ -806,8 +1452,8 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
@@ -827,13 +1473,13 @@ mod tests {
     fn executor_no_root_defaults_to_home() {
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
+            name: tmux_name("s"),
             root: None,
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
@@ -844,16 +1490,16 @@ mod tests {
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         ex.run(&session).unwrap();
 
         let calls = b.calls();
         assert!(
-            calls.iter().any(|c| c.contains("$HOME")),
-            "null root should fall back to $HOME"
+            calls.iter().any(|c| c.contains('~')),
+            "null root should fall back to ~"
         );
     }
 
@@ -866,28 +1512,28 @@ mod tests {
         *b.capture_output.borrow_mut() = "not what we want".into();
 
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: LayoutNode::Pane {
                     command: None,
                     focus: false,
                     title: None,
                     wait_for: Some(WaitFor {
-                        pattern: "ready".into(),
-                        timeout: 2,
+                        pattern: wp("ready"),
+                        timeout: WaitTimeoutSeconds::new(2).unwrap(),
                     }),
                 },
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         let result = ex.run(&session);
@@ -904,15 +1550,6 @@ mod tests {
         );
     }
 
-    // Suppress unused import warning for EnvVar in this test module
-    #[allow(dead_code)]
-    fn _use_env_var() -> EnvVar {
-        EnvVar {
-            key: "K".into(),
-            value: "V".into(),
-        }
-    }
-
     // ── Security: recursion depth limit ──────────────────────────────────────
 
     #[test]
@@ -920,20 +1557,20 @@ mod tests {
         use crate::test_fixtures::make_deeply_nested;
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: make_deeply_nested(65),
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         let result = ex.run(&session);
@@ -949,20 +1586,20 @@ mod tests {
         use crate::test_fixtures::make_deeply_nested;
         let b = RecordingBackend::new();
         let session = Session {
-            name: "s".into(),
-            root: Some("/tmp".into()),
+            name: tmux_name("s"),
+            root: Some(root_template("/tmp")),
             windows: vec![Window {
-                name: "w".into(),
+                name: tmux_name("w"),
                 root: None,
                 env: vec![],
-                options: HashMap::new(),
+                options: BTreeMap::new(),
                 select_layout: None,
                 layout: make_deeply_nested(64),
             }],
             env: vec![],
             pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         let ex = Executor::new(&b);
         assert!(ex.run(&session).is_ok(), "depth 64 should be accepted");

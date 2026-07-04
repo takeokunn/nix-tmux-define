@@ -1,0 +1,47 @@
+# A monitoring session in YAML that exercises the richer features:
+# template variables, a pre_hook, session/window options, select_layout,
+# and wait_for (block until a pattern appears in pane output).
+name: monitoring
+root: "{{home}}"
+
+vars:
+  home: /home/user
+
+env:
+  - key: TERM
+    value: screen-256color
+
+pre_hook: echo "starting monitoring session at {{date}}"
+
+options:
+  status: "on"
+
+windows:
+  - name: services
+    select_layout: tiled
+    options:
+      synchronize-panes: "off"
+    layout:
+      type: split
+      direction: horizontal
+      ratio: 0.5
+      first:
+        type: pane
+        command: htop
+        title: htop
+      second:
+        type: split
+        direction: vertical
+        ratio: 0.5
+        first:
+          type: pane
+          command: docker compose up
+          title: app
+          wait_for:
+            pattern: "Listening on"
+            timeout: 60
+        second:
+          type: pane
+          command: docker compose logs -f
+          title: logs
+          focus: true

@@ -7,18 +7,7 @@
 #   programs.nix-tmux-define = {
 #     enable = true;
 #     sessions.myproject = {
-#       name    = "myproject";
-#       root    = "~/src/myproject";
-#       windows = [{
-#         name   = "main";
-#         layout = {
-#           type      = "split";
-#           direction = "horizontal";
-#           ratio     = 0.6;
-#           first     = { type = "pane"; command = "nvim ."; focus = true; };
-#           second    = { type = "pane"; command = "cargo watch -x check"; };
-#         };
-#       }];
+#       configPath = "${config.home.homeDirectory}/.config/nix-tmux-define/myproject.json";
 #     };
 #   };
 { self }:
@@ -39,137 +28,133 @@ let
     else
       self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
-  # ── Type definitions mirroring the Rust JSON schema ────────────────────────
+  cli = "${cliPkg}/bin/nix-tmux-define";
 
-  envVarType = lib.types.submodule {
-    options = {
-      key = lib.mkOption { type = lib.types.str; };
-      value = lib.mkOption { type = lib.types.str; };
-    };
-  };
+  validCommandName = value: builtins.match "[A-Za-z0-9][A-Za-z0-9._+-]*" value != null;
 
-  paneType = lib.types.submodule {
-    options = {
-      type = lib.mkOption {
-        type = lib.types.enum [ "pane" ];
-        default = "pane";
-      };
-      command = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Shell command sent to this pane on startup";
-      };
-      focus = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Move focus to this pane after session creation";
-      };
-      title = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Pane title set via select-pane -T";
-      };
-    };
-  };
+  sessionType = lib.types.submodule (
+    { name, ... }:
+    {
+      options = {
+        configPath = lib.mkOption {
+          type = lib.types.str;
+          description = ''
+            Absolute runtime path to a JSON, TOML, YAML, or YML session config.
 
-  # Split node uses lib.types.anything for the recursive children
-  # to avoid Nix's infinite-recursion limitation on self-referential types.
-  splitType = lib.types.submodule {
-    options = {
-      type = lib.mkOption {
-        type = lib.types.enum [ "split" ];
-        default = "split";
-      };
-      direction = lib.mkOption {
-        type = lib.types.enum [ "horizontal" "vertical" ];
-        description = "horizontal = side-by-side; vertical = top/bottom";
-      };
-      ratio = lib.mkOption {
-        type = lib.types.float;
-        default = 0.5;
-        description = "Fraction [0.0, 1.0] of space given to the first child";
-      };
-      first = lib.mkOption {
-        type = lib.types.anything;
-        description = "Left / top layout child";
-      };
-      second = lib.mkOption {
-        type = lib.types.anything;
-        description = "Right / bottom layout child";
-      };
-    };
-  };
+            The module intentionally stores only this path in the Nix store. Do
+            not point at a store path unless `allowStoreConfigPath` is enabled.
+          '';
+          example = lib.literalExpression ''"${config.home.homeDirectory}/.config/nix-tmux-define/dev.json"'';
+        };
 
-  windowType = lib.types.submodule {
-    options = {
-      name = lib.mkOption {
-        type = lib.types.str;
-        description = "tmux window name";
-      };
-      layout = lib.mkOption {
-        type = lib.types.anything;
-        description = "Root layout node (pane or recursive split tree)";
-      };
-      root = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Working directory for this window; overrides session root";
-      };
-      env = lib.mkOption {
-        type = lib.types.listOf envVarType;
-        default = [ ];
-        description = "Environment variables exported before this window is created";
-      };
-    };
-  };
+        commandName = lib.mkOption {
+          type = lib.types.str;
+          default = "tmux-session-${name}";
+          defaultText = lib.literalExpression ''"tmux-session-<attribute-name>"'';
+          description = "Command installed into PATH for this session.";
+          example = "tmux-dev";
+        };
 
-  sessionType = lib.types.submodule {
-    options = {
-      name = lib.mkOption {
-        type = lib.types.str;
-        description = "tmux session name";
+        validateOnActivation = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = "Validate the referenced config during Home Manager activation.";
+        };
+
+        allowStoreConfigPath = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit `configPath` to point into the Nix store.
+
+            This is disabled by default because session configs may contain
+            commands, environment variables, and template variables that should
+            not be copied into world-readable store paths.
+          '';
+        };
       };
-      root = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Default working directory for all panes";
-      };
-      windows = lib.mkOption {
-        type = lib.types.listOf windowType;
-        description = "Ordered list of windows";
-      };
-      env = lib.mkOption {
-        type = lib.types.listOf envVarType;
-        default = [ ];
-        description = "Session-level environment variables";
-      };
-      pre_hook = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        description = "Shell command run before the session is created (e.g. nix build)";
-      };
-    };
-  };
+    }
+  );
 
   # ── Per-session derivation ────────────────────────────────────────────────
 
   makeSession =
     sessionCfg:
     let
-      jsonFile = pkgs.writeText "nix-tmux-define-${sessionCfg.name}.json" (
-        builtins.toJSON sessionCfg
-      );
+      configArg = lib.escapeShellArg sessionCfg.configPath;
+      helpArgs = lib.concatMapStringsSep " " lib.escapeShellArg [
+        "Usage: ${sessionCfg.commandName} [--run|--reload|--print|--validate]"
+        ""
+        "  --run       create or attach to the session (default)"
+        "  --reload    replace only the named session"
+        "  --print     print the generated bash script"
+        "  --validate  validate the session config"
+      ];
     in
-    pkgs.writeShellScriptBin "tmux-session-${sessionCfg.name}" ''
+    pkgs.writeShellScriptBin sessionCfg.commandName ''
+      set -euo pipefail
+
       case "''${1:-}" in
         --reload|-r)
-          exec ${cliPkg}/bin/nix-tmux-define run --config ${jsonFile} --kill-server
+          exec ${cli} reload --config ${configArg}
+          ;;
+        --print|-p)
+          exec ${cli} print --config ${configArg}
+          ;;
+        --validate|-v)
+          exec ${cli} validate --config ${configArg}
+          ;;
+        --run|"")
+          exec ${cli} run --config ${configArg}
+          ;;
+        --help|-h)
+          printf '%s\n' ${helpArgs}
           ;;
         *)
-          exec bash <(${cliPkg}/bin/nix-tmux-define print --config ${jsonFile})
+          printf 'unknown option: %s\n' "$1" >&2
+          printf '%s\n' ${lib.escapeShellArg "try '${sessionCfg.commandName} --help'"} >&2
+          exit 64
           ;;
       esac
     '';
+
+  makeAssertions = sessionName: sessionCfg: [
+    {
+      assertion = lib.hasPrefix "/" sessionCfg.configPath;
+      message = ''
+        programs.nix-tmux-define.sessions.${sessionName}.configPath must be an absolute runtime path.
+      '';
+    }
+    {
+      assertion =
+        sessionCfg.allowStoreConfigPath || !(lib.hasPrefix "${builtins.storeDir}/" sessionCfg.configPath);
+      message = ''
+        programs.nix-tmux-define.sessions.${sessionName}.configPath points into ${builtins.storeDir}.
+        Move the session config outside the Nix store, or set allowStoreConfigPath = true for non-secret configs.
+      '';
+    }
+    {
+      assertion = validCommandName sessionCfg.commandName;
+      message = ''
+        programs.nix-tmux-define.sessions.${sessionName}.commandName must contain only letters, numbers, dots, underscores, plus signs, or hyphens.
+      '';
+    }
+  ];
+
+  sessionsToValidate = lib.filterAttrs (_: sessionCfg: sessionCfg.validateOnActivation) cfg.sessions;
+
+  validationScript = lib.concatStringsSep "\n" (
+    lib.mapAttrsToList (
+      sessionName: sessionCfg:
+      let
+        statusLine = lib.escapeShellArg "validating nix-tmux-define session ${sessionName}";
+      in
+      ''
+        printf '%s\n' ${statusLine}
+        ${cli} validate --config ${lib.escapeShellArg sessionCfg.configPath} >/dev/null
+      ''
+    ) sessionsToValidate
+  );
 
 in
 {
@@ -189,24 +174,18 @@ in
       type = lib.types.attrsOf sessionType;
       default = { };
       description = ''
-        Attribute set of tmux sessions.  For each entry a
-        `tmux-session-<name>` command is added to your PATH.
+        Attribute set of tmux session launchers. Each entry references an
+        existing runtime config file and adds a command to PATH.
+
+        Session contents are deliberately not accepted inline here, because
+        serializing commands and environment values through Nix would place them
+        in the world-readable Nix store.
       '';
       example = lib.literalExpression ''
         {
           dev = {
-            name    = "dev";
-            root    = "~/src/myproject";
-            windows = [{
-              name   = "main";
-              layout = {
-                type      = "split";
-                direction = "horizontal";
-                ratio     = 0.6;
-                first  = { type = "pane"; command = "nvim ."; focus = true; };
-                second = { type = "pane"; command = "cargo watch -x check"; };
-              };
-            }];
+            configPath = "''${config.home.homeDirectory}/.config/nix-tmux-define/dev.json";
+            commandName = "tmux-dev";
           };
         }
       '';
@@ -214,8 +193,15 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages =
-      [ cliPkg ]
-      ++ (lib.mapAttrsToList (_: sessionCfg: makeSession sessionCfg) cfg.sessions);
+    assertions = lib.concatLists (lib.mapAttrsToList makeAssertions cfg.sessions);
+
+    home.activation.nix-tmux-define-validate = lib.mkIf (sessionsToValidate != { }) (
+      lib.hm.dag.entryAfter [ "writeBoundary" ] validationScript
+    );
+
+    home.packages = [
+      cliPkg
+    ]
+    ++ (lib.mapAttrsToList (_: sessionCfg: makeSession sessionCfg) cfg.sessions);
   };
 }

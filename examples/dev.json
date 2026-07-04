@@ -1,0 +1,27 @@
+{
+  "name": "dev",
+  "root": "~/src/project",
+  "env": [{ "key": "EDITOR", "value": "nvim" }],
+  "windows": [
+    {
+      "name": "main",
+      "layout": {
+        "type": "split",
+        "direction": "horizontal",
+        "ratio": 0.6,
+        "first": { "type": "pane", "command": "nvim .", "focus": true, "title": "editor" },
+        "second": {
+          "type": "split",
+          "direction": "vertical",
+          "ratio": 0.5,
+          "first": { "type": "pane", "command": "cargo watch -x check" },
+          "second": { "type": "pane", "command": "git status", "title": "git" }
+        }
+      }
+    },
+    {
+      "name": "logs",
+      "layout": { "type": "pane", "command": "journalctl -f" }
+    }
+  ]
+}

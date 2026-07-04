@@ -1,0 +1,12 @@
+# Minimal single-window session in TOML.
+# Run with: nix-tmux-define print --config examples/simple.toml
+name = "simple"
+root = "~"
+
+[[windows]]
+name = "shell"
+
+[windows.layout]
+type = "pane"
+command = "echo hello from nix-tmux-define"
+focus = true

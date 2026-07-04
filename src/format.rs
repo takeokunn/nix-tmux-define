@@ -10,34 +10,45 @@ use std::path::Path;
 pub fn load_session(path: &Path) -> Result<Session> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read '{}'", path.display()))?;
-    match path.extension().and_then(|e| e.to_str()) {
+    // Strip UTF-8 BOM (U+FEFF) that Windows editors sometimes prepend.
+    // Without this, serde_json/serde_yaml produce misleading parse errors.
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let session: Session = match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
-            toml::from_str(&raw).with_context(|| format!("invalid TOML in '{}'", path.display()))
+            toml::from_str(raw).with_context(|| format!("invalid TOML in '{}'", path.display()))?
         }
-        Some("yaml") | Some("yml") => serde_yaml::from_str(&raw)
-            .with_context(|| format!("invalid YAML in '{}'", path.display())),
-        _ => serde_json::from_str(&raw)
-            .with_context(|| format!("invalid JSON in '{}'", path.display())),
-    }
+        Some("yaml") | Some("yml") => serde_yaml::from_str(raw)
+            .with_context(|| format!("invalid YAML in '{}'", path.display()))?,
+        _ => serde_json::from_str(raw)
+            .with_context(|| format!("invalid JSON in '{}'", path.display()))?,
+    };
+    session.validate()?;
+    Ok(session)
 }
 
-/// Load all sessions from a directory, silently skipping files with errors.
+/// Load all supported session configs from a directory.
 ///
 /// Only `.json`, `.toml`, `.yaml`, and `.yml` files are considered.
+/// Extension-less files (e.g. `config`) are intentionally ignored even though
+/// `load_session()` would attempt JSON parsing for them; use `load_session()`
+/// directly when you need to load a file without a recognised extension.
+/// Supported config files must parse and validate successfully.
 /// The returned list is sorted by session name.
 pub fn load_sessions_from_dir(dir: &Path) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("cannot read directory '{}'", dir.display()))?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("cannot read entry in directory '{}'", dir.display()))?;
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if matches!(ext, "json" | "toml" | "yaml" | "yml") {
-                    match load_session(&path) {
-                        Ok(s) => sessions.push(s),
-                        Err(e) => eprintln!("warning: skipping '{}': {}", path.display(), e),
-                    }
+                    let session = load_session(&path).with_context(|| {
+                        format!("failed to load session config '{}'", path.display())
+                    })?;
+                    sessions.push(session);
                 }
             }
         }
@@ -83,6 +94,14 @@ type = "pane"
     #[test]
     fn load_json() {
         let f = write_temp(".json", json_content());
+        let s = load_session(f.path()).unwrap();
+        assert_eq!(s.name, "test-session");
+        assert_eq!(s.windows.len(), 1);
+    }
+
+    #[test]
+    fn load_json_with_utf8_bom() {
+        let f = write_temp(".json", &format!("\u{FEFF}{}", json_content()));
         let s = load_session(f.path()).unwrap();
         assert_eq!(s.name, "test-session");
         assert_eq!(s.windows.len(), 1);
@@ -168,14 +187,17 @@ type = "pane"
     }
 
     #[test]
-    fn load_sessions_from_dir_skips_invalid_content() {
+    fn load_sessions_from_dir_rejects_invalid_content() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bad.json"), "{ invalid }").unwrap();
         std::fs::write(dir.path().join("good.json"), json_content()).unwrap();
 
-        let sessions = load_sessions_from_dir(dir.path()).unwrap();
-        assert_eq!(sessions.len(), 1, "invalid file should be silently skipped");
-        assert_eq!(sessions[0].name, "test-session");
+        let err = load_sessions_from_dir(dir.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bad.json"),
+            "error should identify the invalid config file: {message}"
+        );
     }
 
     #[test]
@@ -204,5 +226,31 @@ type = "pane"
     fn load_sessions_from_dir_nonexistent_returns_err() {
         let result = load_sessions_from_dir(Path::new("/nonexistent/directory"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_session_accepts_dynamic_builtin_in_session_root() {
+        let f = write_temp(
+            ".json",
+            r#"{"name":"s","root":"{{cwd}}","windows":[{"name":"w","layout":{"type":"pane"}}]}"#,
+        );
+        let session = load_session(f.path()).unwrap();
+        assert_eq!(session.root.as_deref(), Some("{{cwd}}"));
+    }
+
+    #[test]
+    fn load_session_accepts_dynamic_builtin_in_window_root() {
+        let f = write_temp(
+            ".json",
+            r#"{"name":"s","windows":[{"name":"w","root":"{{git_branch}}","layout":{"type":"pane"}}]}"#,
+        );
+        let session = load_session(f.path()).unwrap();
+        assert_eq!(session.windows[0].root.as_deref(), Some("{{git_branch}}"));
+    }
+
+    #[test]
+    fn load_session_allows_static_root() {
+        let f = write_temp(".json", json_content());
+        assert!(load_session(f.path()).is_ok());
     }
 }

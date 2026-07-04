@@ -1,3 +1,6 @@
 /target/
 /result
 /result-*
+
+# proptest writes a regression seed file here when a property test fails
+proptest-regressions/

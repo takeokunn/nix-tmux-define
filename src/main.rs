@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use nix_tmux_define::{
-    load_session, load_sessions_from_dir, Compiler, Executor, RealTmux, Session,
+    load_session, load_sessions_from_dir, Compiler, Executor, RealTmux, Session, TmuxName,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 #[derive(Parser)]
 #[command(
@@ -19,14 +19,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a tmux session from a config file (uses RealTmux, no bash script)
+    /// Start or attach to a tmux session from a config file
     Run {
         /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
-        /// Kill the tmux server before creating the session (wipes all sessions)
-        #[arg(long, short = 'k')]
-        kill_server: bool,
     },
 
     /// Print the generated bash script to stdout without executing
@@ -43,19 +40,22 @@ enum Command {
         config: PathBuf,
     },
 
-    /// Kill and re-create a session from a config file
+    /// Atomically replace a named session from a config file
     Reload {
         /// Path to the session config (JSON, TOML, or YAML)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
     },
 
-    /// List all sessions from config files
+    /// List sessions from config files without probing tmux by default
     List {
         #[arg(long, value_name = "PATH")]
         config: Vec<PathBuf>,
         #[arg(long, value_name = "DIR")]
         config_dir: Option<PathBuf>,
+        /// Probe tmux and mark configs whose session is currently running
+        #[arg(long)]
+        running_status: bool,
     },
 
     /// Print the JSON Schema for the session config format
@@ -74,93 +74,76 @@ fn generate(session: &Session) -> Result<String> {
     Ok(compiler.into_script())
 }
 
-fn session_running(name: &str) -> bool {
-    std::process::Command::new("tmux")
-        .args(["has-session", "-t", name])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+fn running_sessions_outcome(
+    success: bool,
+    status: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<HashSet<TmuxName>> {
+    if success {
+        let stdout = std::str::from_utf8(stdout)
+            .context("`tmux list-sessions` returned non-UTF-8 session names")?;
 
-fn format_session_line(s: &Session, is_running: bool) -> String {
-    let running = if is_running { " [running]" } else { "" };
-    format!("{}{} — {} window(s)", s.name, running, s.windows.len())
-}
-
-fn print_session_list(sessions: &[Session]) {
-    for s in sessions {
-        println!("{}", format_session_line(s, session_running(&s.name)));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nix_tmux_define::{LayoutNode, Session, Window};
-    use std::collections::HashMap;
-
-    fn make_session(name: &str, window_count: usize) -> Session {
-        let windows: Vec<Window> = (0..window_count)
-            .map(|i| Window {
-                name: format!("w{}", i),
-                root: None,
-                env: vec![],
-                options: HashMap::new(),
-                select_layout: None,
-                layout: LayoutNode::Pane {
-                    command: None,
-                    focus: false,
-                    title: None,
-                    wait_for: None,
-                },
+        return stdout
+            .lines()
+            .map(|name| {
+                TmuxName::new(name.to_owned()).with_context(|| {
+                    format!("invalid tmux session name from `tmux list-sessions`: {name:?}")
+                })
             })
             .collect();
-        Session {
-            name: name.into(),
-            root: None,
-            windows,
-            env: vec![],
-            pre_hook: None,
-            options: HashMap::new(),
-            vars: HashMap::new(),
-        }
     }
 
-    #[test]
-    fn format_session_line_not_running() {
-        let s = make_session("dev", 2);
-        let line = format_session_line(&s, false);
-        assert_eq!(line, "dev — 2 window(s)");
+    let stderr = tmux_stderr(stderr);
+    if is_tmux_no_server(&stderr) {
+        return Ok(HashSet::new());
     }
 
-    #[test]
-    fn format_session_line_running() {
-        let s = make_session("prod", 3);
-        let line = format_session_line(&s, true);
-        assert_eq!(line, "prod [running] — 3 window(s)");
+    if stderr.is_empty() {
+        anyhow::bail!("`tmux list-sessions` failed with {status}");
     }
+    anyhow::bail!("`tmux list-sessions` failed: {stderr}");
+}
 
-    #[test]
-    fn generate_returns_bash_script() {
-        let s = make_session("test", 1);
-        let script = generate(&s).unwrap();
-        assert!(script.starts_with("#!/usr/bin/env bash"));
-        assert!(script.contains("tmux new-session"));
+fn running_sessions() -> Result<HashSet<TmuxName>> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .context("failed to execute `tmux list-sessions`")?;
+    running_sessions_outcome(
+        output.status.success(),
+        &output.status.to_string(),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+fn tmux_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).trim().to_owned()
+}
+
+fn is_tmux_no_server(stderr: &str) -> bool {
+    stderr.contains("no server running")
+}
+
+fn format_session_line(s: &Session, running: Option<&HashSet<TmuxName>>) -> String {
+    let is_running = running
+        .map(|sessions| sessions.contains(s.name.as_str()))
+        .unwrap_or(false);
+    let tag = if is_running { " [running]" } else { "" };
+    format!("{}{} — {} window(s)", s.name, tag, s.windows.len())
+}
+
+fn print_session_list(sessions: &[Session], running: Option<&HashSet<TmuxName>>) {
+    for s in sessions {
+        println!("{}", format_session_line(s, running));
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config, kill_server } => {
-            if kill_server {
-                std::process::Command::new("tmux")
-                    .args(["kill-server"])
-                    .stderr(Stdio::null())
-                    .status()
-                    .ok();
-            }
+        Command::Run { config } => {
             let session = load_session(&config)?;
             let backend = RealTmux;
             let executor = Executor::new(&backend);
@@ -191,6 +174,7 @@ fn main() -> Result<()> {
         Command::List {
             config: configs,
             config_dir,
+            running_status,
         } => {
             let mut sessions = Vec::new();
             for p in &configs {
@@ -202,11 +186,16 @@ fn main() -> Result<()> {
             if configs.is_empty() && config_dir.is_none() {
                 sessions.extend(load_sessions_from_dir(Path::new("."))?);
             }
-            print_session_list(&sessions);
+            let running = if running_status {
+                Some(running_sessions()?)
+            } else {
+                None
+            };
+            print_session_list(&sessions, running.as_ref());
         }
 
         Command::Schema => {
-            println!("{}", nix_tmux_define::json_schema());
+            println!("{}", nix_tmux_define::json_schema()?);
         }
 
         Command::Completions { shell } => {
@@ -215,4 +204,121 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix_tmux_define::{LayoutNode, Session, Window};
+    use std::collections::BTreeMap;
+
+    fn tmux_name(value: &str) -> TmuxName {
+        TmuxName::new(value).unwrap()
+    }
+
+    fn make_session(name: &str, window_count: usize) -> Session {
+        let windows: Vec<Window> = (0..window_count)
+            .map(|i| Window {
+                name: tmux_name(&format!("w{}", i)),
+                root: None,
+                env: vec![],
+                options: BTreeMap::new(),
+                select_layout: None,
+                layout: LayoutNode::Pane {
+                    command: None,
+                    focus: false,
+                    title: None,
+                    wait_for: None,
+                },
+            })
+            .collect();
+        Session {
+            name: tmux_name(name),
+            root: None,
+            windows,
+            env: vec![],
+            pre_hook: None,
+            options: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn format_session_line_not_running() {
+        let s = make_session("dev", 2);
+        let line = format_session_line(&s, None);
+        assert_eq!(line, "dev — 2 window(s)");
+    }
+
+    #[test]
+    fn format_session_line_running() {
+        let s = make_session("prod", 3);
+        let running = [tmux_name("prod")].into_iter().collect();
+        let line = format_session_line(&s, Some(&running));
+        assert_eq!(line, "prod [running] — 3 window(s)");
+    }
+
+    #[test]
+    fn format_session_line_ignores_running_without_status_probe() {
+        let s = make_session("prod", 3);
+        let running = [tmux_name("prod")].into_iter().collect::<HashSet<_>>();
+        let line = format_session_line(&s, None);
+        assert_eq!(line, "prod — 3 window(s)");
+        assert!(running.contains("prod"));
+    }
+
+    #[test]
+    fn generate_returns_bash_script() {
+        let s = make_session("test", 1);
+        let script = generate(&s).unwrap();
+        assert!(script.starts_with("#!/usr/bin/env bash"));
+        assert!(script.contains("tmux new-session"));
+    }
+
+    #[test]
+    fn running_sessions_parses_valid_tmux_names() {
+        let sessions =
+            running_sessions_outcome(true, "exit status: 0", b"dev\nprod\n", b"").unwrap();
+        assert!(sessions.contains("dev"));
+        assert!(sessions.contains("prod"));
+    }
+
+    #[test]
+    fn running_sessions_rejects_invalid_tmux_name_from_tmux() {
+        let err = running_sessions_outcome(true, "exit status: 0", b"bad:name\n", b"").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid tmux session name from `tmux list-sessions`"));
+    }
+
+    #[test]
+    fn running_sessions_rejects_non_utf8_names() {
+        let err = running_sessions_outcome(true, "exit status: 0", b"dev\xff\n", b"").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`tmux list-sessions` returned non-UTF-8 session names"
+        );
+    }
+
+    #[test]
+    fn running_sessions_ignores_missing_tmux_server() {
+        let sessions = running_sessions_outcome(
+            false,
+            "exit status: 1",
+            b"",
+            b"no server running on /tmp/tmux-501/default",
+        )
+        .unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn running_sessions_reports_unexpected_failure() {
+        let err = running_sessions_outcome(false, "exit status: 1", b"", b"permission denied")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`tmux list-sessions` failed: permission denied"
+        );
+    }
 }

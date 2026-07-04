@@ -1,11 +1,7 @@
 use anyhow::Context;
-use schemars::{
-    r#gen::SchemaGenerator,
-    schema::{InstanceType, NumberValidation, Schema, SchemaObject, StringValidation},
-    JsonSchema,
-};
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::ops::Deref;
@@ -151,20 +147,16 @@ impl<'de> Deserialize<'de> for SplitRatio {
 }
 
 impl JsonSchema for SplitRatio {
-    fn schema_name() -> String {
-        "SplitRatio".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "SplitRatio".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Number.into()),
-            format: Some("double".to_owned()),
-            number: Some(Box::new(NumberValidation {
-                minimum: Some(Self::MIN_INCLUSIVE),
-                exclusive_maximum: Some(Self::MAX_EXCLUSIVE),
-                ..NumberValidation::default()
-            })),
-            ..SchemaObject::default()
+        json_schema!({
+            "type": "number",
+            "format": "double",
+            "minimum": Self::MIN_INCLUSIVE,
+            "exclusiveMaximum": Self::MAX_EXCLUSIVE,
         })
     }
 }
@@ -248,19 +240,15 @@ impl<'de> Deserialize<'de> for WaitPattern {
 }
 
 impl JsonSchema for WaitPattern {
-    fn schema_name() -> String {
-        "WaitPattern".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "WaitPattern".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                min_length: Some(1),
-                pattern: Some(r"^[^\u0000]+$".to_owned()),
-                ..StringValidation::default()
-            })),
-            ..SchemaObject::default()
+        json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "pattern": r"^[^\u0000]+$",
         })
     }
 }
@@ -313,19 +301,15 @@ impl<'de> Deserialize<'de> for WaitTimeoutSeconds {
 }
 
 impl JsonSchema for WaitTimeoutSeconds {
-    fn schema_name() -> String {
-        "WaitTimeoutSeconds".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "WaitTimeoutSeconds".into()
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Integer.into()),
-            format: Some("uint32".to_owned()),
-            number: Some(Box::new(NumberValidation {
-                minimum: Some(f64::from(Self::MIN_INCLUSIVE)),
-                ..NumberValidation::default()
-            })),
-            ..SchemaObject::default()
+        json_schema!({
+            "type": "integer",
+            "format": "uint32",
+            "minimum": f64::from(Self::MIN_INCLUSIVE),
         })
     }
 }
@@ -538,18 +522,14 @@ impl<'de> Deserialize<'de> for TmuxName {
 }
 
 impl JsonSchema for TmuxName {
-    fn schema_name() -> String {
-        "TmuxName".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "TmuxName".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                pattern: Some(r"^[^:.\u0000-\u001F\u007F]+$".to_owned()),
-                ..StringValidation::default()
-            })),
-            ..SchemaObject::default()
+        json_schema!({
+            "type": "string",
+            "pattern": r"^[^:.\u0000-\u001F\u007F]+$",
         })
     }
 }
@@ -701,18 +681,14 @@ macro_rules! define_validated_string_type {
         }
 
         impl JsonSchema for $type_name {
-            fn schema_name() -> String {
-                stringify!($type_name).to_owned()
+            fn schema_name() -> Cow<'static, str> {
+                stringify!($type_name).into()
             }
 
             fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-                Schema::Object(SchemaObject {
-                    instance_type: Some(InstanceType::String.into()),
-                    string: Some(Box::new(StringValidation {
-                        pattern: Some(r"^[^\u0000]*$".to_owned()),
-                        ..StringValidation::default()
-                    })),
-                    ..SchemaObject::default()
+                json_schema!({
+                    "type": "string",
+                    "pattern": r"^[^\u0000]*$",
                 })
             }
         }

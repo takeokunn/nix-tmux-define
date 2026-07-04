@@ -111,7 +111,7 @@ mod tests {
         let s = json_schema().unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).expect("schema must be valid JSON");
         let ratio = v
-            .pointer("/definitions/SplitRatio")
+            .pointer("/$defs/SplitRatio")
             .expect("schema should define SplitRatio");
 
         assert_eq!(
@@ -135,7 +135,7 @@ mod tests {
         let s = json_schema().unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).expect("schema must be valid JSON");
         let timeout = v
-            .pointer("/definitions/WaitTimeoutSeconds")
+            .pointer("/$defs/WaitTimeoutSeconds")
             .expect("schema should define WaitTimeoutSeconds");
 
         assert_eq!(
